@@ -37,7 +37,10 @@ namespace ImageSimilarityPlugin
 
         // --- Dependency install ---
         private Process _installProcess;
-        private string _installOutput = "";
+        private bool _isInstalling;
+        private float _installProgress;
+        private string _installLog = "";
+        private Vector2 _installLogScrollPos;
 
         [MenuItem("Tools/查找相似图片")]
         public static void ShowWindow()
@@ -89,6 +92,31 @@ namespace ImageSimilarityPlugin
         {
             // --- Environment status bar ---
             DrawEnvironmentBar();
+
+            // --- Install log ---
+            if (_isInstalling)
+            {
+                EditorGUILayout.Space(3);
+
+                // Progress bar
+                Rect barRect = EditorGUILayout.GetControlRect(false, 22);
+                EditorGUI.ProgressBar(barRect, _installProgress,
+                    _installProgress >= 1f ? "安装完成" :
+                    _installProgress >= 0.7f ? "正在安装包..." :
+                    _installProgress > 0f ? "正在下载..." : "准备中...");
+
+                // Scrollable log
+                if (!string.IsNullOrEmpty(_installLog))
+                {
+                    EditorGUILayout.LabelField("安装日志", EditorStyles.boldLabel);
+                    float logHeight = Mathf.Min(200, EditorGUIUtility.currentViewWidth * 0.4f);
+                    _installLogScrollPos = EditorGUILayout.BeginScrollView(
+                        _installLogScrollPos, GUILayout.Height(logHeight));
+                    EditorGUILayout.TextArea(_installLog, EditorStyles.label,
+                        GUILayout.ExpandHeight(true));
+                    EditorGUILayout.EndScrollView();
+                }
+            }
 
             EditorGUILayout.Space(5);
 
@@ -144,10 +172,12 @@ namespace ImageSimilarityPlugin
             }
             else if (!depsOk && !_checkingDeps)
             {
-                if (GUILayout.Button("安装依赖", GUILayout.Width(140)))
+                GUI.enabled = !_isInstalling;
+                if (GUILayout.Button(_isInstalling ? "安装中..." : "安装依赖", GUILayout.Width(140)))
                 {
                     InstallDependencies();
                 }
+                GUI.enabled = true;
             }
 
             EditorGUILayout.EndHorizontal();
@@ -520,7 +550,11 @@ namespace ImageSimilarityPlugin
                 return;
             }
 
-            _statusMessage = "正在安装 Python 依赖包...";
+            _isInstalling = true;
+            _installProgress = 0f;
+            _installLog = "";
+            _installLogScrollPos = Vector2.zero;
+            _statusMessage = "";
             _statusIsError = false;
 
             try
@@ -535,11 +569,45 @@ namespace ImageSimilarityPlugin
                     CreateNoWindow = true,
                 };
 
-                _installProcess = Process.Start(psi);
+                _installProcess = new Process { StartInfo = psi, EnableRaisingEvents = true };
+
+                _installProcess.OutputDataReceived += (sender, e) =>
+                {
+                    if (e.Data != null)
+                    {
+                        EditorApplication.delayCall += () =>
+                        {
+                            _installLog += e.Data + "\n";
+                            // Advance progress based on pip output phases
+                            if (e.Data.Contains("Downloading")) _installProgress += 0.03f;
+                            else if (e.Data.Contains("Installing collected packages")) _installProgress = 0.7f;
+                            else _installProgress += 0.01f;
+                            _installProgress = Mathf.Min(_installProgress, 0.9f);
+                            _installLogScrollPos.y = float.MaxValue; // auto-scroll to bottom
+                            Repaint();
+                        };
+                    }
+                };
+
+                _installProcess.ErrorDataReceived += (sender, e) =>
+                {
+                    if (e.Data != null)
+                    {
+                        EditorApplication.delayCall += () =>
+                        {
+                            _installLog += e.Data + "\n";
+                            _installLogScrollPos.y = float.MaxValue;
+                            Repaint();
+                        };
+                    }
+                };
+
                 _installProcess.Exited += (sender, e) =>
                 {
                     EditorApplication.delayCall += () =>
                     {
+                        _isInstalling = false;
+                        _installProgress = 1f;
                         if (_installProcess.ExitCode == 0)
                         {
                             _depsInstalled = true;
@@ -557,9 +625,14 @@ namespace ImageSimilarityPlugin
                         Repaint();
                     };
                 };
+
+                _installProcess.Start();
+                _installProcess.BeginOutputReadLine();
+                _installProcess.BeginErrorReadLine();
             }
             catch (Exception ex)
             {
+                _isInstalling = false;
                 _statusMessage = $"运行 pip 失败: {ex.Message}";
                 _statusIsError = true;
             }
