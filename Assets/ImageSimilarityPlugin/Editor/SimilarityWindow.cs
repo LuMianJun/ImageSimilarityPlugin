@@ -298,20 +298,40 @@ namespace ImageSimilarityPlugin
                 EditorGUILayout.LabelField(shortName, GUILayout.Width(THUMB_SIZE - 8));
                 EditorGUILayout.EndHorizontal();
 
-                // Thumbnail
+                // Thumbnail (aspect-ratio preserved)
                 Texture2D thumb = GetThumbnail(group.images[i]);
                 Rect thumbRect = GUILayoutUtility.GetRect(THUMB_SIZE, THUMB_SIZE, GUILayout.Width(THUMB_SIZE), GUILayout.Height(THUMB_SIZE));
+
+                // Draw background
+                EditorGUI.DrawRect(thumbRect, new Color(0.2f, 0.2f, 0.2f, 0.5f));
+
                 if (thumb != null)
                 {
-                    GUI.DrawTexture(thumbRect, thumb, ScaleMode.ScaleToFit);
+                    // Calculate aspect-preserving draw rect
+                    float texAspect = (float)thumb.width / Mathf.Max(1, thumb.height);
+                    float drawW, drawH;
+                    if (texAspect >= 1f)
+                    {
+                        drawW = THUMB_SIZE;
+                        drawH = THUMB_SIZE / texAspect;
+                    }
+                    else
+                    {
+                        drawH = THUMB_SIZE;
+                        drawW = THUMB_SIZE * texAspect;
+                    }
+                    float offsetX = thumbRect.x + (THUMB_SIZE - drawW) / 2f;
+                    float offsetY = thumbRect.y + (THUMB_SIZE - drawH) / 2f;
+                    Rect drawRect = new Rect(offsetX, offsetY, drawW, drawH);
+
+                    GUI.DrawTexture(drawRect, thumb, ScaleMode.StretchToFill);
                 }
                 else
                 {
-                    EditorGUI.DrawRect(thumbRect, Color.gray);
                     GUI.Label(thumbRect, "?", EditorStyles.centeredGreyMiniLabel);
                 }
 
-                // Click to ping in project
+                // Click to ping in project (full square area is clickable)
                 if (GUI.Button(thumbRect, GUIContent.none, GUIStyle.none))
                 {
                     PingAsset(group.images[i]);
@@ -615,15 +635,10 @@ namespace ImageSimilarityPlugin
 
             Texture2D tex = null;
 
-            // Try loading as an asset first
-            string assetPath = AbsoluteToAssetPath(path);
-            if (!string.IsNullOrEmpty(assetPath))
-            {
-                tex = AssetDatabase.LoadAssetAtPath<Texture2D>(assetPath);
-            }
-
-            // Fallback: load from raw file
-            if (tex == null && File.Exists(path))
+            // Always load from raw file bytes to preserve original image dimensions.
+            // AssetDatabase.LoadAssetAtPath returns Unity-imported textures which may
+            // have power-of-two dimensions, causing aspect ratio distortion.
+            if (File.Exists(path))
             {
                 try
                 {
@@ -642,7 +657,7 @@ namespace ImageSimilarityPlugin
         {
             foreach (var tex in _thumbnailCache.Values)
             {
-                if (tex != null && !AssetDatabase.Contains(tex))
+                if (tex != null)
                     DestroyImmediate(tex);
             }
             _thumbnailCache.Clear();
