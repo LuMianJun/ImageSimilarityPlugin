@@ -331,10 +331,11 @@ namespace ImageSimilarityPlugin
                     GUI.Label(thumbRect, "?", EditorStyles.centeredGreyMiniLabel);
                 }
 
-                // Click to ping in project (full square area is clickable)
+                // Click thumbnail → open preview window
                 if (GUI.Button(thumbRect, GUIContent.none, GUIStyle.none))
                 {
-                    PingAsset(group.images[i]);
+                    ImagePreviewWindow.Open(group, i,
+                        onRefreshParent: () => Repaint());
                 }
 
                 EditorGUILayout.EndVertical();
