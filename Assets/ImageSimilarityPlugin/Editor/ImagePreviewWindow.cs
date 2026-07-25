@@ -32,7 +32,31 @@ namespace ImageSimilarityPlugin
 
         // --- Reference finder cache ---
         private static bool? _fr2Available;
-        private static MethodInfo _fr2FindMethod;
+
+        /// <summary>
+        /// Whether FR2 is installed and its cache is populated (ready for queries).
+        /// </summary>
+        public static bool IsFR2Ready
+        {
+            get
+            {
+                if (!HasFR2()) return false;
+                try
+                {
+                    Type fr2CacheType = FindTypeInAllAssemblies("FR2_Cache");
+                    var apiProp = fr2CacheType.GetProperty("Api",
+                        BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Public);
+                    var cache = apiProp?.GetValue(null);
+                    var assetMapField = cache?.GetType().GetField("AssetMap",
+                        BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
+                    var assetMap = assetMapField?.GetValue(cache);
+                    var countProp = assetMap?.GetType().GetProperty("Count");
+                    return (int)(countProp?.GetValue(assetMap) ?? 0) > 0;
+                }
+                catch { return false; }
+            }
+        }
+        private static Dictionary<string, int> _refCountCache = new Dictionary<string, int>();
 
         private const int THUMB_HEIGHT = 80;
         private const int MAX_PREVIEW_SIZE = 512;
@@ -214,6 +238,9 @@ namespace ImageSimilarityPlugin
                     _statusMsg = "";
                     Repaint();
                 }
+
+                // FR2 reference count badge (drawn after button to be on top)
+                DrawRefCountBadge(thumbR, path);
 
                 // Filename
                 EditorGUILayout.LabelField(Path.GetFileName(path), EditorStyles.centeredGreyMiniLabel,
@@ -411,114 +438,214 @@ namespace ImageSimilarityPlugin
         //  FR2 Integration
         // ==================================================================
 
-        private static bool HasFR2()
+        /// <summary>
+        /// Find a type by name across all loaded assemblies. Searches both full name
+        /// (namespace.TypeName) and simple name (TypeName) to handle namespace variations.
+        /// </summary>
+        private static Type FindTypeInAllAssemblies(string typeName)
         {
-            if (_fr2Available.HasValue) return _fr2Available.Value;
-
-            // Look for FR2's main cache type by common assembly-qualified names
-            string[] fr2TypeNames = {
-                "FR2_Cache, Assembly-CSharp-Editor, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null",
-                "FR2_Cache, Assembly-CSharp-firstpass, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null",
-            };
-
-            foreach (var name in fr2TypeNames)
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
             {
-                var t = Type.GetType(name);
-                if (t != null)
+                // Try full name first (e.g. "FR2_Cache")
+                var t = asm.GetType(typeName);
+                if (t != null) return t;
+
+                // Try with namespace prefix (e.g. "FR2.FR2_Cache" or "FindReference2.FR2_Cache")
+                t = asm.GetType("FR2." + typeName);
+                if (t != null) return t;
+                t = asm.GetType("FindReference2." + typeName);
+                if (t != null) return t;
+
+                // Fallback: iterate all types and match by simple name
+                try
                 {
-                    // Try to find a "FindReferences" or "FindUsage" method
-                    _fr2FindMethod = t.GetMethod("FindReferences", BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance)
-                                  ?? t.GetMethod("FindUsage", BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance)
-                                  ?? t.GetMethod("FindAssets", BindingFlags.Public | BindingFlags.Static | BindingFlags.Instance);
-
-                    // Also check nested Dependency class
-                    var depType = t.GetNestedType("Dependency", BindingFlags.Public);
-                    if (depType != null)
+                    foreach (var exportedType in asm.GetExportedTypes())
                     {
-                        _fr2FindMethod = depType.GetMethod("Find", BindingFlags.Public | BindingFlags.Static)
-                                      ?? depType.GetMethod("FindAsset", BindingFlags.Public | BindingFlags.Static)
-                                      ?? _fr2FindMethod;
+                        if (exportedType.Name == typeName)
+                            return exportedType;
                     }
+                }
+                catch { }
+            }
+            return null;
+        }
 
-                    _fr2Available = true;
-                    return true;
+        /// <summary>
+        /// Diagnostic: dump all loaded assemblies and any types matching a filter to Console.
+        /// Call from Unity's Console: ImageSimilarityPlugin.ImagePreviewWindow.DiagnoseFR2();
+        /// </summary>
+        [MenuItem("Tools/诊断 FR2 检测")]
+        public static void DiagnoseFR2()
+        {
+            UnityEngine.Debug.Log("=== FR2 诊断 ===");
+            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            UnityEngine.Debug.Log($"已加载程序集总数: {assemblies.Length}");
+
+            foreach (var asm in assemblies)
+            {
+                string name = asm.GetName().Name;
+                // Look for FR2 or FindReference related assemblies
+                if (name.IndexOf("FR2", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("FindReference", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    name.IndexOf("Find Ref", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    UnityEngine.Debug.Log($"  ▶ 程序集: {name}   ({asm.GetTypes().Length} types)");
+                    foreach (var t in asm.GetTypes())
+                    {
+                        if (t.Name.Contains("FR2") || t.Name.Contains("Cache"))
+                            UnityEngine.Debug.Log($"      - {t.FullName}");
+                    }
                 }
             }
 
-            _fr2Available = false;
-            return false;
+            // Also search for FR2_Cache in all assemblies
+            foreach (var asm in assemblies)
+            {
+                var t = asm.GetType("FR2_Cache");
+                if (t != null)
+                {
+                    UnityEngine.Debug.Log($"  ★ 找到 FR2_Cache 在: {asm.GetName().Name}");
+                    UnityEngine.Debug.Log($"      FullName: {t.FullName}");
+                    UnityEngine.Debug.Log($"      Namespace: {t.Namespace}");
+                }
+            }
+
+            // Check for FR2 namespace variations
+            string[] typeNames = { "FR2_Cache", "FR2Cache", "FR2.FR2_Cache", "FindReference2.FR2_Cache" };
+            foreach (var tn in typeNames)
+            {
+                var t = FindTypeInAllAssemblies(tn);
+                if (t != null)
+                    UnityEngine.Debug.Log($"  ✓ 找到: {tn} in assembly {t.Assembly.GetName().Name}");
+                else
+                    UnityEngine.Debug.Log($"  ✗ 未找到: {tn}");
+            }
+
+            UnityEngine.Debug.Log("=== 诊断完毕 ===");
+        }
+
+        /// <summary>
+        /// True if FR2 (Find Reference 2) is installed in this project.
+        /// Key API:
+        ///   FR2_Cache.Api.AssetMap[guid]  → FR2_Asset
+        ///   FR2_Asset.FindUsedBy(asset)   → List&lt;FR2_Asset&gt; (who references this)
+        ///   FR2_Asset.assetPath           → string
+        /// </summary>
+        public static bool HasFR2()
+        {
+            if (_fr2Available.HasValue) return _fr2Available.Value;
+
+            // Search all loaded assemblies for FR2_Cache
+            Type fr2CacheType = FindTypeInAllAssemblies("FR2_Cache");
+            if (fr2CacheType == null)
+            {
+                UnityEngine.Debug.Log("[ImageSimilarityPlugin] FR2 未检测到。");
+                _fr2Available = false;
+                return false;
+            }
+
+            // Verify we can access Api . AssetMap
+            try
+            {
+                var apiProp = fr2CacheType.GetProperty("Api",
+                    BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Public);
+                if (apiProp == null) { _fr2Available = false; return false; }
+
+                var cache = apiProp.GetValue(null);
+                if (cache == null) { _fr2Available = false; return false; }
+
+                var assetMapField = cache.GetType().GetField("AssetMap",
+                    BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
+                if (assetMapField == null) { _fr2Available = false; return false; }
+
+                UnityEngine.Debug.Log("[ImageSimilarityPlugin] FR2 已检测到并可用。");
+                _fr2Available = true;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogWarning($"[ImageSimilarityPlugin] FR2 检测异常: {ex.Message}");
+                _fr2Available = false;
+                return false;
+            }
         }
 
         private List<string> FindWithFR2(HashSet<string> oldAssetPaths)
         {
             var result = new HashSet<string>();
 
-            // Try the FR2_Cache singleton pattern
-            Type fr2Type = Type.GetType("FR2_Cache, Assembly-CSharp-Editor, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null")
-                        ?? Type.GetType("FR2_Cache, Assembly-CSharp-firstpass, Version=0.0.0.0, Culture=neutral, PublicKeyToken=null");
-
-            if (fr2Type == null) return FindWithNativeAPI(oldAssetPaths);
-
             try
             {
-                // Get the Cache instance (often a singleton property)
-                var cacheProp = fr2Type.GetProperty("Cache", BindingFlags.Public | BindingFlags.Static)
-                             ?? fr2Type.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
-                object cacheInstance = null;
+                Type fr2CacheType = FindTypeInAllAssemblies("FR2_Cache");
+                if (fr2CacheType == null) return FindWithNativeAPI(oldAssetPaths);
 
-                if (cacheProp != null)
-                {
-                    cacheInstance = cacheProp.GetValue(null);
-                }
+                // FR2_Cache.Api → cache instance
+                var apiProp = fr2CacheType.GetProperty("Api",
+                    BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Public);
+                var cache = apiProp?.GetValue(null);
+                if (cache == null) return FindWithNativeAPI(oldAssetPaths);
 
-                // Try static Dependency property
-                var depProp = fr2Type.GetProperty("Dependency", BindingFlags.Public | BindingFlags.Static);
-                object depInstance = null;
-                if (depProp != null)
-                    depInstance = depProp.GetValue(cacheInstance);
+                // cache.AssetMap → Dictionary<string, FR2_Asset>
+                var assetMapField = cache.GetType().GetField("AssetMap",
+                    BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
+                var assetMap = assetMapField?.GetValue(cache);
+                if (assetMap == null) return FindWithNativeAPI(oldAssetPaths);
 
-                if (depInstance == null) return FindWithNativeAPI(oldAssetPaths);
+                // Find the indexer or TryGetValue on the dictionary
+                var tryGetMethod = assetMap.GetType().GetMethod("TryGetValue");
+                var indexerProp = assetMap.GetType().GetProperty("Item");
 
-                // Try to find references for each old asset
-                var findMethod = depInstance.GetType().GetMethod("Find",
-                    new[] { typeof(string), typeof(bool) });
-                if (findMethod == null)
-                    findMethod = depInstance.GetType().GetMethod("FindAsset",
-                        new[] { typeof(string) });
-
-                if (findMethod == null) return FindWithNativeAPI(oldAssetPaths);
+                // FR2_Asset.FindUsedBy(FR2_Asset) → List<FR2_Asset>
+                Type fr2AssetType = null;
+                System.Reflection.MethodInfo findUsedByMethod = null;
 
                 foreach (var assetPath in oldAssetPaths)
                 {
                     try
                     {
-                        object references;
-                        if (findMethod.GetParameters().Length == 2)
-                            references = findMethod.Invoke(depInstance, new object[] { assetPath, false });
-                        else
-                            references = findMethod.Invoke(depInstance, new object[] { assetPath });
+                        string guid = AssetDatabase.AssetPathToGUID(assetPath);
+                        if (string.IsNullOrEmpty(guid)) continue;
 
-                        if (references == null) continue;
-
-                        // References is typically a list or dictionary - try to iterate
-                        if (references is System.Collections.IEnumerable enumerable)
+                        // assetMap[guid] → FR2_Asset
+                        object fr2Asset = null;
+                        if (indexerProp != null)
                         {
-                            foreach (var item in enumerable)
-                            {
-                                // Each reference item typically has an "assetPath" or similar property
-                                var pathProp = item.GetType().GetProperty("assetPath",
-                                    BindingFlags.Public | BindingFlags.Instance)
-                                    ?? item.GetType().GetProperty("AssetPath",
-                                    BindingFlags.Public | BindingFlags.Instance)
-                                    ?? item.GetType().GetProperty("path",
-                                    BindingFlags.Public | BindingFlags.Instance);
+                            fr2Asset = indexerProp.GetValue(assetMap, new object[] { guid });
+                        }
+                        else if (tryGetMethod != null)
+                        {
+                            var args = new object[] { guid, null };
+                            if ((bool)tryGetMethod.Invoke(assetMap, args))
+                                fr2Asset = args[1];
+                        }
+                        if (fr2Asset == null) continue;
 
-                                if (pathProp != null)
-                                {
-                                    string refPath = pathProp.GetValue(item) as string;
-                                    if (!string.IsNullOrEmpty(refPath) && refPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
-                                        result.Add(refPath);
-                                }
+                        // Cache the type and method reference
+                        if (fr2AssetType == null)
+                        {
+                            fr2AssetType = fr2Asset.GetType();
+                            findUsedByMethod = fr2AssetType.GetMethod("FindUsedBy",
+                                BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Public);
+                        }
+
+                        if (findUsedByMethod == null) continue;
+
+                        // FR2_Asset.FindUsedBy(asset) → List<FR2_Asset>
+                        var usedByList = findUsedByMethod.Invoke(null, new[] { fr2Asset })
+                            as System.Collections.IList;
+                        if (usedByList == null || usedByList.Count == 0) continue;
+
+                        // Extract assetPath from each FR2_Asset
+                        var pathField = fr2AssetType.GetField("assetPath",
+                            BindingFlags.Public | BindingFlags.Instance);
+
+                        foreach (var item in usedByList)
+                        {
+                            string refPath = pathField?.GetValue(item) as string;
+                            if (!string.IsNullOrEmpty(refPath) &&
+                                refPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
+                            {
+                                result.Add(refPath);
                             }
                         }
                     }
@@ -533,7 +660,118 @@ namespace ImageSimilarityPlugin
                 return new List<string>(result);
             }
 
+            // If FR2 found nothing (cache may be stale), fall back to native
             return FindWithNativeAPI(oldAssetPaths);
+        }
+
+        /// <summary>
+        /// Get the number of assets (prefabs, scenes, etc.) that reference this image.
+        /// Returns 0 if FR2 is not available or the asset is unused.
+        /// Results are cached for the session.
+        /// </summary>
+        public static int GetReferenceCount(string absolutePath)
+        {
+            if (!HasFR2()) return 0;
+
+            string assetPath = AbsoluteToAssetPath(absolutePath);
+            if (string.IsNullOrEmpty(assetPath)) return 0;
+
+            if (_refCountCache.TryGetValue(assetPath, out int cached))
+                return cached;
+
+            int count = 0;
+            try
+            {
+                Type fr2CacheType = FindTypeInAllAssemblies("FR2_Cache");
+                if (fr2CacheType == null) { _refCountCache[assetPath] = 0; return 0; }
+
+                var apiProp = fr2CacheType.GetProperty("Api",
+                    BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Public);
+                var cache = apiProp?.GetValue(null);
+                if (cache == null) { _refCountCache[assetPath] = 0; return 0; }
+
+                var assetMapField = cache.GetType().GetField("AssetMap",
+                    BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
+                var assetMap = assetMapField?.GetValue(cache);
+                if (assetMap == null) { _refCountCache[assetPath] = 0; return 0; }
+
+                string guid = AssetDatabase.AssetPathToGUID(assetPath);
+                if (string.IsNullOrEmpty(guid)) { _refCountCache[assetPath] = 0; return 0; }
+
+                var indexerProp = assetMap.GetType().GetProperty("Item");
+                object fr2Asset = indexerProp?.GetValue(assetMap, new object[] { guid });
+
+                if (fr2Asset == null) { _refCountCache[assetPath] = 0; return 0; }
+
+                var findUsedByMethod = fr2Asset.GetType().GetMethod("FindUsedBy",
+                    BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Public);
+                if (findUsedByMethod != null)
+                {
+                    var usedByList = findUsedByMethod.Invoke(null, new[] { fr2Asset })
+                        as System.Collections.IList;
+                    count = usedByList?.Count ?? 0;
+                }
+                else
+                {
+                    // Fallback: check UsedByMap field directly
+                    var usedByMapField = fr2Asset.GetType().GetField("UsedByMap",
+                        BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
+                    if (usedByMapField != null)
+                    {
+                        var usedByMap = usedByMapField.GetValue(fr2Asset);
+                        var countProp = usedByMap?.GetType().GetProperty("Count");
+                        count = (int)(countProp?.GetValue(usedByMap) ?? 0);
+                    }
+                }
+            }
+            catch { }
+
+            _refCountCache[assetPath] = count;
+            return count;
+        }
+
+        /// <summary>
+        /// Clear the reference count cache (call after FR2 cache rebuild).
+        /// </summary>
+        public static void ClearRefCountCache()
+        {
+            _refCountCache.Clear();
+        }
+
+        /// <summary>
+        /// Draw an FR2 reference-count badge in the top-right corner of a thumbnail rect.
+        /// </summary>
+        public static void DrawRefCountBadge(Rect thumbRect, string imagePath)
+        {
+            if (!HasFR2()) return;
+
+            int count = GetReferenceCount(imagePath);
+            if (count <= 0) return;
+
+            // Badge background (small circle/square in top-right)
+            float badgeSize = 20f;
+            Rect badgeRect = new Rect(
+                thumbRect.xMax - badgeSize - 2,
+                thumbRect.y + 2,
+                badgeSize,
+                badgeSize);
+
+            // Draw circle background
+            Color oldColor = GUI.color;
+            GUI.color = new Color(0.2f, 0.5f, 0.9f, 0.85f);
+            GUI.Box(badgeRect, "", EditorStyles.helpBox);
+
+            // Draw count text
+            var labelStyle = new GUIStyle(EditorStyles.miniLabel)
+            {
+                alignment = TextAnchor.MiddleCenter,
+                fontStyle = FontStyle.Bold,
+                fontSize = 10,
+                normal = { textColor = Color.white }
+            };
+            GUI.color = Color.white;
+            GUI.Label(badgeRect, count > 99 ? "99+" : count.ToString(), labelStyle);
+            GUI.color = oldColor;
         }
 
         // ==================================================================

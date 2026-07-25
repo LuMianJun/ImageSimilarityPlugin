@@ -16,7 +16,7 @@ namespace ImageSimilarityPlugin
     {
         // --- Settings ---
         private string _folderPath = "";
-        private float _threshold = 0.95f;
+        private float _threshold = 0.80f;
         private bool _recursive = true;
         private int _workers = 4;
 
@@ -28,6 +28,7 @@ namespace ImageSimilarityPlugin
         private string _pythonVersion = null;
         private bool _depsInstalled = false;
         private bool _checkingDeps = false;
+        private bool _fr2Ready = false;
 
         // --- Results UI ---
         private Vector2 _scrollPos;
@@ -86,6 +87,8 @@ namespace ImageSimilarityPlugin
             {
                 _depsInstalled = PythonLocator.AreDependenciesInstalled();
             }
+
+            _fr2Ready = ImagePreviewWindow.IsFR2Ready;
         }
 
         private void OnGUI()
@@ -172,7 +175,14 @@ namespace ImageSimilarityPlugin
             EditorGUILayout.LabelField(
                 _checkingDeps ? " 正在检查依赖..." :
                 depsOk ? " 依赖已就绪" : " 缺少依赖",
-                GUILayout.Width(200));
+                GUILayout.Width(180));
+
+            bool fr2Installed = ImagePreviewWindow.HasFR2();
+            GUI.color = _fr2Ready ? Color.green : (fr2Installed ? Color.yellow : Color.red);
+            EditorGUILayout.LabelField(
+                _fr2Ready ? " FR2 已就绪" :
+                fr2Installed ? " FR2 缓存为空" : " FR2 未安装",
+                GUILayout.Width(160));
 
             GUI.color = Color.white;
             GUILayout.FlexibleSpace();
@@ -387,6 +397,9 @@ namespace ImageSimilarityPlugin
                         onRefreshParent: () => Repaint());
                 }
 
+                // FR2 reference count badge (drawn after button to be on top)
+                ImagePreviewWindow.DrawRefCountBadge(thumbRect, group.images[i]);
+
                 EditorGUILayout.EndVertical();
 
                 if (i < maxThumbs - 1)
@@ -568,7 +581,7 @@ namespace ImageSimilarityPlugin
             string pythonPath = PythonLocator.GetPythonPath();
             if (string.IsNullOrEmpty(pythonPath))
             {
-                _installLog = "错误: 未找到 Python，无法安装依赖。\n请先在顶部点击"配置 Python"指定路径。";
+                _installLog = "错误: 未找到 Python，无法安装依赖。\n请先在顶部点击配置 Python指定路径。";
                 _installProgress = 0f;
                 _isInstalling = true; // keep log visible
                 Repaint();
