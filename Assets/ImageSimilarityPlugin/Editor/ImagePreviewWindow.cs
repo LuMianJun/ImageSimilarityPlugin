@@ -26,6 +26,7 @@ namespace ImageSimilarityPlugin
 
         // --- UI state ---
         private Vector2 _scrollInfo;
+        private Vector2 _thumbScroll;
         private string _statusMsg = "";
         private bool _statusIsError;
         private bool _isReplacing;
@@ -202,7 +203,15 @@ namespace ImageSimilarityPlugin
         private void DrawThumbnailRow()
         {
             EditorGUILayout.LabelField("同组图片 — 点击切换预览", EditorStyles.boldLabel);
-            EditorGUILayout.BeginHorizontal();
+
+            float slotWidth = THUMB_HEIGHT + 14;
+            float totalWidth = _group.images.Count * slotWidth + 4;
+
+            // Horizontal scroll so all images are reachable even in narrow windows
+            _thumbScroll = EditorGUILayout.BeginScrollView(
+                _thumbScroll, false, true,
+                GUILayout.Height(THUMB_HEIGHT + 38));
+            EditorGUILayout.BeginHorizontal(GUILayout.Width(totalWidth));
 
             for (int i = 0; i < _group.images.Count; i++)
             {
@@ -234,12 +243,12 @@ namespace ImageSimilarityPlugin
                 if (GUI.Button(thumbR, GUIContent.none, GUIStyle.none))
                 {
                     _selectedIndex = i;
-                    _largePreviewPath = null; // force reload
+                    _largePreviewPath = null;
                     _statusMsg = "";
                     Repaint();
                 }
 
-                // FR2 reference count badge (drawn after button to be on top)
+                // FR2 badge
                 DrawRefCountBadge(thumbR, path);
 
                 // Filename
@@ -251,6 +260,7 @@ namespace ImageSimilarityPlugin
             }
 
             EditorGUILayout.EndHorizontal();
+            EditorGUILayout.EndScrollView();
         }
 
         // ==================================================================

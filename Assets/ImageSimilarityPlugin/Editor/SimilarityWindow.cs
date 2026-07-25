@@ -39,6 +39,7 @@ namespace ImageSimilarityPlugin
 
         // --- Results UI ---
         private Vector2 _scrollPos;
+        private Dictionary<int, Vector2> _thumbScrolls = new Dictionary<int, Vector2>();
         private Dictionary<int, HashSet<int>> _selectedForDeletion = new Dictionary<int, HashSet<int>>(); // groupId -> set of image indices
         private Dictionary<string, Texture2D> _thumbnailCache = new Dictionary<string, Texture2D>();
         private const int THUMB_SIZE = 64;
@@ -380,10 +381,19 @@ namespace ImageSimilarityPlugin
             }
             EditorGUILayout.EndHorizontal();
 
-            // Thumbnails
-            EditorGUILayout.BeginHorizontal();
-            int maxThumbs = Mathf.Min(group.images.Count, 6);
-            for (int i = 0; i < maxThumbs; i++)
+            // Thumbnails — horizontal scroll so all images are shown
+            float thumbSlotWidth = THUMB_SIZE + 12;
+            float rowWidth = group.images.Count * thumbSlotWidth + 4;
+
+            if (!_thumbScrolls.ContainsKey(group.id))
+                _thumbScrolls[group.id] = Vector2.zero;
+            var scroll = _thumbScrolls[group.id];
+            _thumbScrolls[group.id] = EditorGUILayout.BeginScrollView(
+                scroll, false, true,
+                GUILayout.Height(THUMB_SIZE + 40));
+            EditorGUILayout.BeginHorizontal(GUILayout.Width(rowWidth));
+
+            for (int i = 0; i < group.images.Count; i++)
             {
                 bool isSelected = IsSelected(group.id, i);
 
@@ -402,30 +412,22 @@ namespace ImageSimilarityPlugin
 
                 // Thumbnail (aspect-ratio preserved)
                 Texture2D thumb = GetThumbnail(group.images[i]);
-                Rect thumbRect = GUILayoutUtility.GetRect(THUMB_SIZE, THUMB_SIZE, GUILayout.Width(THUMB_SIZE), GUILayout.Height(THUMB_SIZE));
+                Rect thumbRect = GUILayoutUtility.GetRect(THUMB_SIZE, THUMB_SIZE,
+                    GUILayout.Width(THUMB_SIZE), GUILayout.Height(THUMB_SIZE));
 
                 // Draw background
                 EditorGUI.DrawRect(thumbRect, new Color(0.2f, 0.2f, 0.2f, 0.5f));
 
                 if (thumb != null)
                 {
-                    // Calculate aspect-preserving draw rect
                     float texAspect = (float)thumb.width / Mathf.Max(1, thumb.height);
                     float drawW, drawH;
-                    if (texAspect >= 1f)
-                    {
-                        drawW = THUMB_SIZE;
-                        drawH = THUMB_SIZE / texAspect;
-                    }
-                    else
-                    {
-                        drawH = THUMB_SIZE;
-                        drawW = THUMB_SIZE * texAspect;
-                    }
-                    float offsetX = thumbRect.x + (THUMB_SIZE - drawW) / 2f;
-                    float offsetY = thumbRect.y + (THUMB_SIZE - drawH) / 2f;
-                    Rect drawRect = new Rect(offsetX, offsetY, drawW, drawH);
-
+                    if (texAspect >= 1f) { drawW = THUMB_SIZE; drawH = THUMB_SIZE / texAspect; }
+                    else { drawH = THUMB_SIZE; drawW = THUMB_SIZE * texAspect; }
+                    Rect drawRect = new Rect(
+                        thumbRect.x + (THUMB_SIZE - drawW) / 2f,
+                        thumbRect.y + (THUMB_SIZE - drawH) / 2f,
+                        drawW, drawH);
                     GUI.DrawTexture(drawRect, thumb, ScaleMode.StretchToFill);
                 }
                 else
@@ -433,22 +435,20 @@ namespace ImageSimilarityPlugin
                     GUI.Label(thumbRect, "?", EditorStyles.centeredGreyMiniLabel);
                 }
 
-                // Click thumbnail → open preview window
+                // Click → preview window
                 if (GUI.Button(thumbRect, GUIContent.none, GUIStyle.none))
                 {
-                    ImagePreviewWindow.Open(group, i,
-                        onRefreshParent: () => Repaint());
+                    ImagePreviewWindow.Open(group, i, onRefreshParent: () => Repaint());
                 }
 
-                // FR2 reference count badge (drawn after button to be on top)
+                // FR2 badge
                 ImagePreviewWindow.DrawRefCountBadge(thumbRect, group.images[i]);
 
                 EditorGUILayout.EndVertical();
-
-                if (i < maxThumbs - 1)
-                    GUILayout.Space(4);
+                GUILayout.Space(4);
             }
             EditorGUILayout.EndHorizontal();
+            EditorGUILayout.EndScrollView();
 
             // Path list
             EditorGUILayout.LabelField("路径:", EditorStyles.miniLabel);
