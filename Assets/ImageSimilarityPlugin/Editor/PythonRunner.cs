@@ -2,15 +2,15 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
-using System.Threading;
 using UnityEditor;
 using UnityEngine;
 
 namespace ImageSimilarityPlugin
 {
     /// <summary>
-    /// Manages the Python subprocess lifecycle for image similarity scanning.
-    /// Parses PROGRESS: lines from stdout and reads the JSON result file.
+    /// Python 子进程管理器。
+    /// 负责启动 headless CLI、异步读取 stdout/stderr、
+    /// 解析 PROGRESS: 进度行，以及读取结果 JSON 文件。
     /// </summary>
     public class PythonRunner
     {
@@ -19,25 +19,33 @@ namespace ImageSimilarityPlugin
         private bool _cancelled;
         private float _progress;
         private string _outputJsonPath;
-        private Thread _readThread;
 
+        /// <summary>当前是否有扫描正在运行</summary>
         public bool IsRunning => _isRunning;
+
+        /// <summary>扫描进度（0~1），从 Python stdout 的 PROGRESS: 行解析</summary>
         public float Progress => _progress;
 
         /// <summary>
-        /// Returns the path to the Python scripts bundled with the plugin.
+        /// 获取插件捆绑的 Python 脚本所在目录的绝对路径。
+        /// 目录位于 Assets/ImageSimilarityPlugin/Python/ 下。
         /// </summary>
         public static string GetPythonScriptsDir()
         {
-            // Application.dataPath = <project>/Assets
             return Path.GetFullPath(Path.Combine(
                 Application.dataPath,
                 "ImageSimilarityPlugin", "Python"));
         }
 
         /// <summary>
-        /// Start a scan. Events are fired on background thread; poll Progress in OnGUI/Update.
+        /// 启动一次图片相似度扫描。
         /// </summary>
+        /// <param name="folderPath">要扫描的文件夹绝对路径</param>
+        /// <param name="threshold">余弦相似度阈值（0~1）</param>
+        /// <param name="recursive">是否递归子目录</param>
+        /// <param name="workers">并行线程数</param>
+        /// <param name="onComplete">扫描完成回调（主线程），参数为解析后的结果</param>
+        /// <param name="onError">扫描出错回调（主线程），参数为错误描述</param>
         public void StartScan(
             string folderPath,
             float threshold,
@@ -52,6 +60,7 @@ namespace ImageSimilarityPlugin
                 return;
             }
 
+            // 确保 Python 可用
             string pythonPath = PythonLocator.GetPythonPath();
             if (string.IsNullOrEmpty(pythonPath))
             {
@@ -59,16 +68,15 @@ namespace ImageSimilarityPlugin
                 return;
             }
 
+            // 确保 CLI 脚本存在
             string scriptsDir = GetPythonScriptsDir();
             string cliPath = Path.Combine(scriptsDir, "duplicate_detector_cli.py");
-
             if (!File.Exists(cliPath))
             {
                 onError?.Invoke($"未找到 Python CLI 脚本:\n{cliPath}");
                 return;
             }
 
-            // Ensure the feature_extractor module is importable
             string enginePath = Path.Combine(scriptsDir, "feature_extractor.py");
             if (!File.Exists(enginePath))
             {
@@ -76,10 +84,10 @@ namespace ImageSimilarityPlugin
                 return;
             }
 
-            // Output temp file
+            // 结果 JSON 写入临时目录
             _outputJsonPath = Path.Combine(Application.temporaryCachePath, "similarity_result.json");
 
-            // Build arguments
+            // 构建命令行参数
             var sb = new StringBuilder();
             sb.Append("\"").Append(cliPath).Append("\"");
             sb.Append(" --folder \"").Append(folderPath).Append("\"");
@@ -99,23 +107,22 @@ namespace ImageSimilarityPlugin
                     {
                         FileName = pythonPath,
                         Arguments = sb.ToString(),
-                        UseShellExecute = false,
+                        UseShellExecute = false,           // 必须为 false 才能重定向流
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
                         CreateNoWindow = true,
-                        StandardOutputEncoding = Encoding.UTF8,
+                        StandardOutputEncoding = Encoding.UTF8,  // 中文路径兼容
                         StandardErrorEncoding = Encoding.UTF8,
-                        // Set working directory to scripts dir so relative imports work
-                        WorkingDirectory = scriptsDir,
+                        WorkingDirectory = scriptsDir,          // 确保相对导入可用
                     },
                     EnableRaisingEvents = true,
                 };
 
+                // stderr 异步读取，过滤 TensorFlow 噪声日志
                 _process.ErrorDataReceived += (sender, e) =>
                 {
                     if (!string.IsNullOrEmpty(e.Data))
                     {
-                        // Log TF warnings to Unity console, but filter noise
                         if (!e.Data.StartsWith("WARNING:") &&
                             !e.Data.StartsWith("I0000") &&
                             !e.Data.Contains("oneDNN"))
@@ -125,11 +132,11 @@ namespace ImageSimilarityPlugin
                     }
                 };
 
+                // stdout 异步读取，解析 PROGRESS: 行
                 _process.OutputDataReceived += (sender, e) =>
                 {
                     if (string.IsNullOrEmpty(e.Data) || _cancelled) return;
 
-                    // Parse PROGRESS:<int>
                     if (e.Data.StartsWith("PROGRESS:"))
                     {
                         string numStr = e.Data.Substring("PROGRESS:".Length).Trim();
@@ -140,11 +147,10 @@ namespace ImageSimilarityPlugin
                     }
                 };
 
+                // 进程退出回调
                 _process.Exited += (sender, e) =>
                 {
                     _isRunning = false;
-
-                    // Delay to let streams flush
                     try { _process.WaitForExit(); } catch { }
 
                     if (_cancelled)
@@ -161,7 +167,7 @@ namespace ImageSimilarityPlugin
                         return;
                     }
 
-                    // Read JSON result
+                    // 回到主线程读取 JSON 结果
                     EditorApplication.delayCall += () =>
                     {
                         try
@@ -208,7 +214,9 @@ namespace ImageSimilarityPlugin
         }
 
         /// <summary>
-        /// Cancel the running scan. Safe to call from any thread.
+        /// 取消正在运行的扫描。
+        /// 会强制终止子进程并清理临时 JSON 文件。
+        /// 可以安全地多次调用。
         /// </summary>
         public void Cancel()
         {
@@ -225,6 +233,7 @@ namespace ImageSimilarityPlugin
             CleanupTempFile();
         }
 
+        /// <summary>清理临时的 JSON 结果文件</summary>
         private void CleanupTempFile()
         {
             try

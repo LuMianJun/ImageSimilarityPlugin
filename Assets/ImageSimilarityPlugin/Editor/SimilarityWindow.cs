@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Text;
 using UnityEditor;
@@ -9,18 +8,20 @@ using UnityEngine;
 namespace ImageSimilarityPlugin
 {
     /// <summary>
-    /// Unity Editor window for finding similar/duplicate images using a Python backend.
-    /// Open via Tools > Find Similar Images.
+    /// 图片相似度检测工具的主窗口。
+    /// 提供文件夹选择、参数配置、Python 扫描调度、结果分组展示、
+    /// 缓存管理、依赖安装以及批量删除功能。
+    /// 菜单入口: Tools > 查找相似图片
     /// </summary>
     public class SimilarityWindow : EditorWindow
     {
-        // --- Settings ---
+        // ===== 扫描参数 =====
         private string _folderPath = "";
         private float _threshold = 0.80f;
         private bool _recursive = true;
         private int _workers = 4;
 
-        // --- State ---
+        // ===== 运行状态 =====
         private PythonRunner _runner;
         private ScanResultData _results;
         private string _statusMessage = "";
@@ -30,26 +31,26 @@ namespace ImageSimilarityPlugin
         private bool _checkingDeps = false;
         private bool _fr2Ready = false;
 
-        // --- Cache ---
+        // ===== 扫描结果缓存 =====
         private static string CacheDir => Path.Combine(Application.temporaryCachePath, "ImageSimilarityPlugin");
-        private string _cachePath;         // path to the cache file for current folder
-        private string _lastCheckedFolder; // track folder changes for cache re-check
-        private bool _hasCache;            // valid cache exists
-        private string _cacheInfo;         // display info about the cache
+        private string _cachePath;         // 当前文件夹对应的缓存文件路径
+        private string _lastCheckedFolder; // 上一次检查缓存的文件夹，用于检测变化
+        private bool _hasCache;            // 是否有有效缓存可用
+        private string _cacheInfo;         // 缓存摘要信息（用于 UI 显示）
 
-        // --- Results UI ---
+        // ===== 结果 UI =====
         private Vector2 _scrollPos;
         private Dictionary<int, Vector2> _thumbScrolls = new Dictionary<int, Vector2>();
-        private Dictionary<int, HashSet<int>> _selectedForDeletion = new Dictionary<int, HashSet<int>>(); // groupId -> set of image indices
+        private Dictionary<int, HashSet<int>> _selectedForDeletion = new Dictionary<int, HashSet<int>>();
         private Dictionary<string, Texture2D> _thumbnailCache = new Dictionary<string, Texture2D>();
         private const int THUMB_SIZE = 64;
 
-        // --- Dependency install ---
-        private Process _installProcess;
-        private bool _isInstalling;
-        private float _installProgress;
-        private string _installLog = "";
-        private Vector2 _installLogScrollPos;
+        // ===== 依赖安装 =====
+        private DependencyInstaller _installer;
+
+        // ==================================================================
+        //  窗口生命周期
+        // ==================================================================
 
         [MenuItem("Tools/查找相似图片")]
         public static void ShowWindow()
@@ -62,7 +63,16 @@ namespace ImageSimilarityPlugin
         private void OnEnable()
         {
             _runner = new PythonRunner();
-            // Default to the project's Assets folder
+            _installer = new DependencyInstaller();
+            _installer.OnCompleted += (success, msg) =>
+            {
+                if (success) _depsInstalled = true;
+                _statusMessage = msg;
+                _statusIsError = !success;
+                Repaint();
+            };
+
+            // 默认扫描整个 Assets 目录
             if (string.IsNullOrEmpty(_folderPath))
                 _folderPath = Application.dataPath;
 
@@ -75,11 +85,16 @@ namespace ImageSimilarityPlugin
             ClearThumbnailCache();
         }
 
+        /// <summary>
+        /// 检测运行环境：Python 是否可用、依赖是否安装、FR2 是否就绪、是否有缓存。
+        /// Python 路径和依赖状态的结果会缓存在 EditorPrefs 中。
+        /// </summary>
         private void CheckEnvironment()
         {
             string pyPath = PythonLocator.GetPythonPath();
             _pythonVersion = pyPath != null ? PythonLocator.GetPythonVersion() : null;
 
+            // 首次检查依赖时为异步（耗时 1~15 秒），显示"检查中"状态
             if (pyPath != null && !PythonLocator.WereDependenciesChecked())
             {
                 _checkingDeps = true;
@@ -96,82 +111,36 @@ namespace ImageSimilarityPlugin
                 _depsInstalled = PythonLocator.AreDependenciesInstalled();
             }
 
-            _fr2Ready = ImagePreviewWindow.IsFR2Ready;
+            _fr2Ready = FR2Integration.IsReady;
             CheckCache();
         }
+
+        // ==================================================================
+        //  主 GUI 布局
+        // ==================================================================
 
         private void OnGUI()
         {
-            // Re-check cache when folder changes
-            CheckCache();
-
-            // --- Environment status bar ---
-            DrawEnvironmentBar();
-
-            // --- Install log ---
-            if (_isInstalling)
-            {
-                EditorGUILayout.Space(3);
-                EditorGUILayout.BeginVertical(EditorStyles.helpBox);
-
-                // Title bar with close button
-                EditorGUILayout.BeginHorizontal();
-                EditorGUILayout.LabelField("安装日志", EditorStyles.boldLabel);
-                GUILayout.FlexibleSpace();
-                bool isRunning = _installProcess != null && !_installProcess.HasExited;
-                if (!isRunning)
-                {
-                    if (GUILayout.Button("关闭", EditorStyles.miniButton, GUILayout.Width(40)))
-                    {
-                        CloseInstallLog();
-                        EditorGUILayout.EndHorizontal();
-                        EditorGUILayout.EndVertical();
-                        return;
-                    }
-                }
-                EditorGUILayout.EndHorizontal();
-
-                // Progress bar
-                Rect barRect = EditorGUILayout.GetControlRect(false, 22);
-                EditorGUI.ProgressBar(barRect, _installProgress,
-                    _installProgress >= 1f ? "安装完成" :
-                    _installProgress >= 0.7f ? "正在安装包..." :
-                    _installProgress > 0f ? "正在下载..." : "准备中...");
-
-                // Scrollable log
-                if (!string.IsNullOrEmpty(_installLog))
-                {
-                    float logHeight = Mathf.Min(200, EditorGUIUtility.currentViewWidth * 0.4f);
-                    _installLogScrollPos = EditorGUILayout.BeginScrollView(
-                        _installLogScrollPos, GUILayout.Height(logHeight));
-                    EditorGUILayout.TextArea(_installLog, EditorStyles.label,
-                        GUILayout.ExpandHeight(true));
-                    EditorGUILayout.EndScrollView();
-                }
-
-                EditorGUILayout.EndVertical();
-            }
-
+            CheckCache();               // 检测文件夹是否改变，刷新缓存状态
+            DrawEnvironmentBar();        // 顶部环境状态栏
+            DrawInstallLog();            // 依赖安装日志（仅安装中可见）
             EditorGUILayout.Space(5);
-
-            // --- Settings ---
-            DrawSettings();
-
+            DrawSettings();              // 扫描参数设置
             EditorGUILayout.Space(5);
-
-            // --- Scan button + progress ---
-            DrawScanControls();
-
+            DrawScanControls();          // 扫描按钮 + 进度条 + 缓存提示
             EditorGUILayout.Space(5);
-
-            // --- Results ---
-            DrawResults();
+            DrawResults();               // 结果分组卡片
         }
 
         // ==================================================================
-        //  Environment
+        //  顶部环境状态栏
         // ==================================================================
 
+        /// <summary>
+        /// 绘制三色状态栏：Python 版本、依赖状态、FR2 状态。
+        /// 绿色 = 就绪，黄色 = 检查中/缓存为空，红色 = 未安装/缺失。
+        /// 未安装时提供"配置 Python"或"安装依赖"按钮。
+        /// </summary>
         private void DrawEnvironmentBar()
         {
             EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
@@ -179,17 +148,20 @@ namespace ImageSimilarityPlugin
             bool pythonOk = !string.IsNullOrEmpty(_pythonVersion);
             bool depsOk = _depsInstalled;
 
+            // Python 状态
             GUI.color = pythonOk ? Color.green : Color.red;
             EditorGUILayout.LabelField(pythonOk ? $" Python {_pythonVersion}" : " 未找到 Python",
                 GUILayout.Width(200));
 
+            // 依赖状态
             GUI.color = depsOk ? Color.green : (_checkingDeps ? Color.yellow : Color.red);
             EditorGUILayout.LabelField(
                 _checkingDeps ? " 正在检查依赖..." :
                 depsOk ? " 依赖已就绪" : " 缺少依赖",
                 GUILayout.Width(180));
 
-            bool fr2Installed = ImagePreviewWindow.HasFR2();
+            // FR2 状态
+            bool fr2Installed = FR2Integration.HasFR2();
             GUI.color = _fr2Ready ? Color.green : (fr2Installed ? Color.yellow : Color.red);
             EditorGUILayout.LabelField(
                 _fr2Ready ? " FR2 已就绪" :
@@ -199,6 +171,7 @@ namespace ImageSimilarityPlugin
             GUI.color = Color.white;
             GUILayout.FlexibleSpace();
 
+            // 操作按钮
             if (!pythonOk)
             {
                 if (GUILayout.Button("配置 Python...", GUILayout.Width(140)))
@@ -213,8 +186,8 @@ namespace ImageSimilarityPlugin
             }
             else if (!depsOk && !_checkingDeps)
             {
-                GUI.enabled = !_isInstalling;
-                if (GUILayout.Button(_isInstalling ? "安装中..." : "安装依赖", GUILayout.Width(140)))
+                GUI.enabled = !_installer.IsInstalling;
+                if (GUILayout.Button(_installer.IsInstalling ? "安装中..." : "安装依赖", GUILayout.Width(140)))
                 {
                     InstallDependencies();
                 }
@@ -225,14 +198,70 @@ namespace ImageSimilarityPlugin
         }
 
         // ==================================================================
-        //  Settings
+        //  依赖安装日志
         // ==================================================================
 
+        /// <summary>
+        /// 如果正在安装依赖，显示进度条和实时滚动日志。
+        /// 安装完成或出错后出现"关闭"按钮。
+        /// </summary>
+        private void DrawInstallLog()
+        {
+            if (!_installer.IsInstalling) return;
+
+            EditorGUILayout.Space(3);
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("安装日志", EditorStyles.boldLabel);
+            GUILayout.FlexibleSpace();
+            if (_installer.Progress >= 1f || string.IsNullOrEmpty(_installer.Log))
+            {
+                // 已完成或出错时可关闭
+            }
+            if (_installer.Progress >= 1f || _installer.Log.StartsWith("错误"))
+            {
+                if (GUILayout.Button("关闭", EditorStyles.miniButton, GUILayout.Width(40)))
+                {
+                    _installer.Close();
+                    EditorGUILayout.EndHorizontal();
+                    EditorGUILayout.EndVertical();
+                    return;
+                }
+            }
+            EditorGUILayout.EndHorizontal();
+
+            Rect barRect = EditorGUILayout.GetControlRect(false, 22);
+            EditorGUI.ProgressBar(barRect, _installer.Progress,
+                _installer.Progress >= 1f ? "安装完成" :
+                _installer.Progress >= 0.7f ? "正在安装包..." :
+                _installer.Progress > 0f ? "正在下载..." : "准备中...");
+
+            if (!string.IsNullOrEmpty(_installer.Log))
+            {
+                float logHeight = Mathf.Min(200, EditorGUIUtility.currentViewWidth * 0.4f);
+                var scrollPos = _installer.LogScrollPos;
+                _installer.LogScrollPos = EditorGUILayout.BeginScrollView(
+                    scrollPos, GUILayout.Height(logHeight));
+                EditorGUILayout.TextArea(_installer.Log, EditorStyles.label, GUILayout.ExpandHeight(true));
+                EditorGUILayout.EndScrollView();
+            }
+
+            EditorGUILayout.EndVertical();
+        }
+
+        // ==================================================================
+        //  扫描设置
+        // ==================================================================
+
+        /// <summary>
+        /// 绘制扫描参数区域：文件夹选择、相似度阈值、递归开关、线程数。
+        /// </summary>
         private void DrawSettings()
         {
             EditorGUILayout.LabelField("扫描设置", EditorStyles.boldLabel);
 
-            // Folder
+            // 文件夹选择
             EditorGUILayout.BeginHorizontal();
             EditorGUILayout.LabelField("文件夹:", GUILayout.Width(60));
             _folderPath = EditorGUILayout.TextField(_folderPath);
@@ -244,14 +273,14 @@ namespace ImageSimilarityPlugin
             }
             EditorGUILayout.EndHorizontal();
 
-            // Threshold
+            // 相似度阈值滑块（0~1）
             EditorGUILayout.BeginHorizontal();
             EditorGUILayout.LabelField("相似度阈值:", GUILayout.Width(80));
             _threshold = EditorGUILayout.Slider(_threshold, 0f, 1.00f);
             EditorGUILayout.LabelField(_threshold.ToString("F3"), GUILayout.Width(40));
             EditorGUILayout.EndHorizontal();
 
-            // Recursive + Workers
+            // 递归 + 线程数
             EditorGUILayout.BeginHorizontal();
             _recursive = EditorGUILayout.ToggleLeft("递归子目录", _recursive, GUILayout.Width(100));
             EditorGUILayout.LabelField("线程数:", GUILayout.Width(60));
@@ -260,9 +289,12 @@ namespace ImageSimilarityPlugin
         }
 
         // ==================================================================
-        //  Scan Controls
+        //  扫描控制
         // ==================================================================
 
+        /// <summary>
+        /// 绘制扫描按钮、取消按钮、进度条、状态消息以及缓存加载提示。
+        /// </summary>
         private void DrawScanControls()
         {
             EditorGUILayout.BeginHorizontal();
@@ -289,14 +321,14 @@ namespace ImageSimilarityPlugin
 
             EditorGUILayout.EndHorizontal();
 
-            // Progress bar
+            // 扫描进度条
             if (_runner.IsRunning)
             {
                 Rect r = EditorGUILayout.GetControlRect(false, 20);
                 EditorGUI.ProgressBar(r, _runner.Progress, $"正在扫描... {(_runner.Progress * 100f):F0}%");
             }
 
-            // Status
+            // 状态消息
             if (!string.IsNullOrEmpty(_statusMessage))
             {
                 GUI.color = _statusIsError ? Color.red : Color.white;
@@ -304,7 +336,7 @@ namespace ImageSimilarityPlugin
                 GUI.color = Color.white;
             }
 
-            // Cache hint
+            // 缓存可用提示（无缓存结果时显示加载按钮）
             if (_hasCache && _results == null && !_runner.IsRunning)
             {
                 EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
@@ -318,7 +350,7 @@ namespace ImageSimilarityPlugin
                 EditorGUILayout.EndHorizontal();
             }
 
-            // Clear cache button (when results are from cache)
+            // 缓存已加载提示
             if (_results != null && _hasCache && !_runner.IsRunning)
             {
                 EditorGUILayout.BeginHorizontal();
@@ -338,9 +370,12 @@ namespace ImageSimilarityPlugin
         }
 
         // ==================================================================
-        //  Results
+        //  结果展示
         // ==================================================================
 
+        /// <summary>
+        /// 绘制所有结果分组。如果没有结果则什么都不显示。
+        /// </summary>
         private void DrawResults()
         {
             if (_results == null || _results.groups == null || _results.groups.Count == 0)
@@ -364,24 +399,29 @@ namespace ImageSimilarityPlugin
             EditorGUILayout.EndScrollView();
         }
 
+        /// <summary>
+        /// 绘制单组相似图片卡片。
+        /// 包含：组头、水平滚动缩略图行（支持选择 + FR2 角标）、
+        /// 路径列表、"定位"按钮、自动选择重复项、删除选中资产。
+        /// </summary>
         private void DrawGroupCard(DuplicateGroup group)
         {
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
 
-            // Header
+            // 组头
             EditorGUILayout.BeginHorizontal();
             EditorGUILayout.LabelField($"第 {group.id} 组", EditorStyles.boldLabel, GUILayout.Width(80));
             EditorGUILayout.LabelField($"{group.images.Count} 张图片");
             GUILayout.FlexibleSpace();
 
-            // Select duplicates button (auto-select based on heuristics)
+            // 自动选择重复项（启发式：保留文件最大且文件名不含 Copy 的）
             if (GUILayout.Button("自动选择重复项", GUILayout.Width(150)))
             {
                 AutoSelectDuplicates(group);
             }
             EditorGUILayout.EndHorizontal();
 
-            // Thumbnails — horizontal scroll so all images are shown
+            // 缩略图行 — 水平滚动，支持任意数量图片
             float thumbSlotWidth = THUMB_SIZE + 12;
             float rowWidth = group.images.Count * thumbSlotWidth + 4;
 
@@ -389,8 +429,7 @@ namespace ImageSimilarityPlugin
                 _thumbScrolls[group.id] = Vector2.zero;
             var scroll = _thumbScrolls[group.id];
             _thumbScrolls[group.id] = EditorGUILayout.BeginScrollView(
-                scroll, false, true,
-                GUILayout.Height(THUMB_SIZE + 40));
+                scroll, false, true, GUILayout.Height(THUMB_SIZE + 40));
             EditorGUILayout.BeginHorizontal(GUILayout.Width(rowWidth));
 
             for (int i = 0; i < group.images.Count; i++)
@@ -399,23 +438,18 @@ namespace ImageSimilarityPlugin
 
                 EditorGUILayout.BeginVertical(GUILayout.Width(THUMB_SIZE + 8));
 
-                // Selection toggle
+                // 选择框 + 文件名
                 EditorGUILayout.BeginHorizontal();
                 bool newSelected = EditorGUILayout.Toggle(isSelected, GUILayout.Width(16));
                 if (newSelected != isSelected)
                     ToggleSelection(group.id, i);
-
-                // Filename label
-                string shortName = Path.GetFileName(group.images[i]);
-                EditorGUILayout.LabelField(shortName, GUILayout.Width(THUMB_SIZE - 8));
+                EditorGUILayout.LabelField(Path.GetFileName(group.images[i]), GUILayout.Width(THUMB_SIZE - 8));
                 EditorGUILayout.EndHorizontal();
 
-                // Thumbnail (aspect-ratio preserved)
+                // 缩略图（保宽高比）
                 Texture2D thumb = GetThumbnail(group.images[i]);
                 Rect thumbRect = GUILayoutUtility.GetRect(THUMB_SIZE, THUMB_SIZE,
                     GUILayout.Width(THUMB_SIZE), GUILayout.Height(THUMB_SIZE));
-
-                // Draw background
                 EditorGUI.DrawRect(thumbRect, new Color(0.2f, 0.2f, 0.2f, 0.5f));
 
                 if (thumb != null)
@@ -435,14 +469,14 @@ namespace ImageSimilarityPlugin
                     GUI.Label(thumbRect, "?", EditorStyles.centeredGreyMiniLabel);
                 }
 
-                // Click → preview window
+                // 点击缩略图 → 打开大图预览窗口
                 if (GUI.Button(thumbRect, GUIContent.none, GUIStyle.none))
                 {
                     ImagePreviewWindow.Open(group, i, onRefreshParent: () => Repaint());
                 }
 
-                // FR2 badge
-                ImagePreviewWindow.DrawRefCountBadge(thumbRect, group.images[i]);
+                // FR2 引用数角标
+                FR2Integration.DrawRefCountBadge(thumbRect, group.images[i]);
 
                 EditorGUILayout.EndVertical();
                 GUILayout.Space(4);
@@ -450,7 +484,7 @@ namespace ImageSimilarityPlugin
             EditorGUILayout.EndHorizontal();
             EditorGUILayout.EndScrollView();
 
-            // Path list
+            // 路径列表（每张图可定位）
             EditorGUILayout.LabelField("路径:", EditorStyles.miniLabel);
             foreach (var img in group.images)
             {
@@ -458,12 +492,12 @@ namespace ImageSimilarityPlugin
                 EditorGUILayout.LabelField("  " + img, EditorStyles.miniLabel);
                 if (GUILayout.Button("定位", EditorStyles.miniButton, GUILayout.Width(40)))
                 {
-                    PingAsset(img);
+                    PluginUtils.PingAsset(img);
                 }
                 EditorGUILayout.EndHorizontal();
             }
 
-            // Delete button
+            // 删除选中资产按钮
             EditorGUILayout.BeginHorizontal();
             int selectedCount = GetSelectedCount(group.id);
             GUI.enabled = selectedCount > 0 && IsInProjectAssets(group);
@@ -478,9 +512,13 @@ namespace ImageSimilarityPlugin
         }
 
         // ==================================================================
-        //  Actions
+        //  扫描操作
         // ==================================================================
 
+        /// <summary>
+        /// 启动扫描。先验证文件夹存在，然后通过 PythonRunner 异步启动 Python 子进程。
+        /// 完成后自动保存结果到缓存。
+        /// </summary>
         private void StartScan()
         {
             if (!Directory.Exists(_folderPath))
@@ -518,12 +556,13 @@ namespace ImageSimilarityPlugin
             );
         }
 
+        /// <summary>
+        /// 启发式自动选择重复项。
+        /// 规则：文件体积最大的优先保留；文件名含 "Copy" 或 "_old" 的降权。
+        /// 选中组内除"最佳"图片外的所有图片。
+        /// </summary>
         private void AutoSelectDuplicates(DuplicateGroup group)
         {
-            // Heuristic: keep the "best" image, mark others as duplicates.
-            // "Best" = largest file that doesn't look like a copy.
-            // Simple approach: keep the first (by path length / file size), select rest.
-
             int bestIndex = 0;
             long bestScore = 0;
 
@@ -535,9 +574,10 @@ namespace ImageSimilarityPlugin
                     var fi = new FileInfo(group.images[i]);
                     score = fi.Exists ? fi.Length : 0;
 
-                    // Penalize filenames that look like copies
+                    // 文件名含 Copy 或 _old 的减半（可能是副本）
                     string name = Path.GetFileNameWithoutExtension(group.images[i]);
-                    if (name.Contains("Copy") || name.Contains("copy") || name.EndsWith("_old") || name.EndsWith("_Old"))
+                    if (name.Contains("Copy") || name.Contains("copy")
+                        || name.EndsWith("_old") || name.EndsWith("_Old"))
                         score /= 2;
                 }
                 catch { }
@@ -549,29 +589,29 @@ namespace ImageSimilarityPlugin
                 }
             }
 
-            // Select all except the best
+            // 选中除最佳外的所有图片
             for (int i = 0; i < group.images.Count; i++)
             {
-                if (i != bestIndex)
-                    SetSelection(group.id, i, true);
-                else
-                    SetSelection(group.id, i, false);
+                SetSelection(group.id, i, i != bestIndex);
             }
 
             Repaint();
         }
 
+        /// <summary>
+        /// 删除组内选中的图片资产。
+        /// 仅支持项目 Assets 目录内的文件（通过 AssetDatabase.DeleteAsset），
+        /// 外部文件需手动删除。操作可撤销（Ctrl+Z）。
+        /// </summary>
         private void DeleteSelected(DuplicateGroup group)
         {
             if (!IsInProjectAssets(group))
             {
                 EditorUtility.DisplayDialog("无法删除",
-                    "部分图片不在项目 Assets 文件夹内，" +
-                    "请通过文件管理器手动删除。", "确定");
+                    "部分图片不在项目 Assets 文件夹内，请通过文件管理器手动删除。", "确定");
                 return;
             }
 
-            // Collect selected images
             var toDelete = new List<string>();
             for (int i = 0; i < group.images.Count; i++)
             {
@@ -581,18 +621,17 @@ namespace ImageSimilarityPlugin
 
             if (toDelete.Count == 0) return;
 
-            string msg = $"确认删除 {toDelete.Count} 张图片？\n\n文件将移至回收站，" +
-                         "可通过 Ctrl+Z 撤销此操作。";
+            string msg = $"确认删除 {toDelete.Count} 张图片？\n\n文件将移至回收站，可通过 Ctrl+Z 撤销此操作。";
             if (!EditorUtility.DisplayDialog("确认删除", msg, "删除", "取消"))
                 return;
 
+            // 批量删除以减少资源刷新次数
             AssetDatabase.StartAssetEditing();
             try
             {
                 foreach (var path in toDelete)
                 {
-                    // Convert absolute path to relative asset path
-                    string assetPath = AbsoluteToAssetPath(path);
+                    string assetPath = PluginUtils.AbsoluteToAssetPath(path);
                     if (!string.IsNullOrEmpty(assetPath))
                     {
                         AssetDatabase.DeleteAsset(assetPath);
@@ -605,7 +644,6 @@ namespace ImageSimilarityPlugin
                 AssetDatabase.Refresh();
             }
 
-            // Remove deleted items from the group
             group.images.RemoveAll(img => toDelete.Contains(img));
             ClearSelection(group.id);
             _statusMessage = $"已删除 {toDelete.Count} 个资产。";
@@ -613,133 +651,45 @@ namespace ImageSimilarityPlugin
             Repaint();
         }
 
+        // ==================================================================
+        //  依赖安装
+        // ==================================================================
+
+        /// <summary>
+        /// 启动 pip install 安装缺失的 Python 依赖。
+        /// stdout/stderr 实时输出到日志面板，进度条根据输出关键词推进。
+        /// </summary>
+        /// <summary>
+        /// 启动 pip install 安装缺失的 Python 依赖。
+        /// 委托给 DependencyInstaller，通过 OnCompleted 回调接收结果。
+        /// </summary>
         private void InstallDependencies()
         {
-            _isInstalling = true;
-            _installProgress = 0f;
-            _installLog = "";
-            _installLogScrollPos = Vector2.zero;
             _statusMessage = "";
             _statusIsError = false;
-
             string pythonPath = PythonLocator.GetPythonPath();
-            if (string.IsNullOrEmpty(pythonPath))
-            {
-                _installLog = "错误: 未找到 Python，无法安装依赖。\n请先在顶部点击配置 Python指定路径。";
-                _installProgress = 0f;
-                _isInstalling = true; // keep log visible
-                Repaint();
-                return;
-            }
-
             string reqPath = Path.Combine(PythonRunner.GetPythonScriptsDir(), "requirements.txt");
-            if (!File.Exists(reqPath))
-            {
-                _installLog = $"错误: 未找到 requirements.txt\n路径: {reqPath}";
-                _installProgress = 0f;
-                _statusMessage = $"未找到 requirements.txt: {reqPath}";
-                _statusIsError = true;
-                Repaint();
-                return;
-            }
-
-            try
-            {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = pythonPath,
-                    Arguments = $"-m pip install -r \"{reqPath}\"",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true,
-                };
-
-                _installProcess = new Process { StartInfo = psi, EnableRaisingEvents = true };
-
-                _installProcess.OutputDataReceived += (sender, e) =>
-                {
-                    if (e.Data != null)
-                    {
-                        EditorApplication.delayCall += () =>
-                        {
-                            _installLog += e.Data + "\n";
-                            // Advance progress based on pip output phases
-                            if (e.Data.Contains("Downloading")) _installProgress += 0.03f;
-                            else if (e.Data.Contains("Installing collected packages")) _installProgress = 0.7f;
-                            else _installProgress += 0.01f;
-                            _installProgress = Mathf.Min(_installProgress, 0.9f);
-                            _installLogScrollPos.y = float.MaxValue; // auto-scroll to bottom
-                            Repaint();
-                        };
-                    }
-                };
-
-                _installProcess.ErrorDataReceived += (sender, e) =>
-                {
-                    if (e.Data != null)
-                    {
-                        EditorApplication.delayCall += () =>
-                        {
-                            _installLog += e.Data + "\n";
-                            _installLogScrollPos.y = float.MaxValue;
-                            Repaint();
-                        };
-                    }
-                };
-
-                _installProcess.Exited += (sender, e) =>
-                {
-                    EditorApplication.delayCall += () =>
-                    {
-                        _installProgress = 1f;
-                        if (_installProcess.ExitCode == 0)
-                        {
-                            _depsInstalled = true;
-                            _statusMessage = "依赖包安装成功。";
-                            _statusIsError = false;
-                        }
-                        else
-                        {
-                            _statusMessage = "依赖包安装失败，请手动运行:\n" +
-                                             $"pip install -r \"{reqPath}\"";
-                            _statusIsError = true;
-                        }
-                        _installProcess.Dispose();
-                        _installProcess = null;
-                        Repaint();
-                    };
-                };
-
-                _installProcess.Start();
-                _installProcess.BeginOutputReadLine();
-                _installProcess.BeginErrorReadLine();
-            }
-            catch (Exception ex)
-            {
-                _installLog += $"\n错误: {ex.Message}";
-                _installProgress = 0f;
-                _statusMessage = $"运行 pip 失败: {ex.Message}";
-                _statusIsError = true;
-                // keep _isInstalling = true so user can see the log
-                Repaint();
-            }
+            _installer.StartInstall(pythonPath, reqPath);
+            Repaint();
         }
 
         /// <summary>
-        /// Close the install log panel.
+        /// 关闭安装日志面板。
         /// </summary>
         private void CloseInstallLog()
         {
-            _isInstalling = false;
-            _installLog = "";
-            try { if (_installProcess != null && !_installProcess.HasExited) _installProcess.Kill(); } catch { }
+            _installer.Close();
         }
 
         // ==================================================================
-        //  Cache
+        //  缓存
         // ==================================================================
 
+        /// <summary>
+        /// 检测当前文件夹是否有对应的扫描缓存。
+        /// 每种文件夹对应一个独立的缓存文件（文件名基于路径哈希）。
+        /// 如果文件夹未变则跳过检测。
+        /// </summary>
         private void CheckCache()
         {
             if (_folderPath == _lastCheckedFolder) return;
@@ -765,6 +715,10 @@ namespace ImageSimilarityPlugin
             _cacheInfo = "";
         }
 
+        /// <summary>
+        /// 保存扫描结果到缓存。
+        /// 同时写入元数据（CacheMeta）和完整结果（_result.json）两个文件。
+        /// </summary>
         private void SaveCache(ScanResultData result)
         {
             try
@@ -780,7 +734,6 @@ namespace ImageSimilarityPlugin
                 }, true);
                 File.WriteAllText(_cachePath, meta, Encoding.UTF8);
 
-                // Also save full results alongside
                 string resultPath = _cachePath.Replace(".json", "_result.json");
                 string resultJson = JsonUtility.ToJson(result, true);
                 File.WriteAllText(resultPath, resultJson, Encoding.UTF8);
@@ -794,6 +747,10 @@ namespace ImageSimilarityPlugin
             }
         }
 
+        /// <summary>
+        /// 从缓存加载扫描结果，恢复上次的完整 UI 状态。
+        /// 加载前清除选择状态和缩略图缓存。
+        /// </summary>
         private void LoadCache()
         {
             string resultPath = _cachePath.Replace(".json", "_result.json");
@@ -819,6 +776,9 @@ namespace ImageSimilarityPlugin
             }
         }
 
+        /// <summary>
+        /// 删除当前文件夹对应的所有缓存文件。
+        /// </summary>
         private void DeleteCache()
         {
             try
@@ -832,13 +792,17 @@ namespace ImageSimilarityPlugin
             _cacheInfo = "";
         }
 
+        /// <summary>
+        /// 基于文件夹路径的稳定哈希生成缓存文件名。
+        /// 不同文件夹对应不同的缓存，互不干扰。
+        /// </summary>
         private string GetCacheFilePath()
         {
-            // Generate a stable filename from the folder path
             string hash = _folderPath.GetHashCode().ToString("X8");
             return Path.Combine(CacheDir, $"scan_{hash}.json");
         }
 
+        /// <summary>缓存的元数据结构（不包含完整分组信息）</summary>
         [Serializable]
         private class CacheMeta
         {
@@ -850,7 +814,7 @@ namespace ImageSimilarityPlugin
         }
 
         // ==================================================================
-        //  Helpers
+        //  工具方法
         // ==================================================================
 
         private bool IsSelected(int groupId, int imageIndex)
@@ -890,39 +854,33 @@ namespace ImageSimilarityPlugin
             _selectedForDeletion.Remove(groupId);
         }
 
+        /// <summary>
+        /// 判断组内所有图片是否都在项目 Assets 目录下。
+        /// 如果是外部文件，不能使用 AssetDatabase 删除。
+        /// </summary>
         private bool IsInProjectAssets(DuplicateGroup group)
         {
             string assetsRoot = Application.dataPath.Replace('/', Path.DirectorySeparatorChar);
             foreach (var img in group.images)
             {
-                string full = Path.GetFullPath(img);
-                if (!full.StartsWith(assetsRoot, StringComparison.OrdinalIgnoreCase))
+                if (!Path.GetFullPath(img).StartsWith(assetsRoot, StringComparison.OrdinalIgnoreCase))
                     return false;
             }
             return true;
         }
 
-        private string AbsoluteToAssetPath(string absolutePath)
-        {
-            string assetsRoot = Application.dataPath.Replace('/', Path.DirectorySeparatorChar);
-            string full = Path.GetFullPath(absolutePath);
-            if (!full.StartsWith(assetsRoot, StringComparison.OrdinalIgnoreCase))
-                return null;
-
-            string relative = full.Substring(assetsRoot.Length).TrimStart(Path.DirectorySeparatorChar);
-            return "Assets/" + relative.Replace('\\', '/');
-        }
-
+        /// <summary>
+        /// 获取缩略图纹理。
+        /// 始终从原始文件字节加载，以保留原始尺寸，
+        /// 避免 Unity 导入的 2 次幂纹理导致宽高比失真。
+        /// 结果会缓存以加速重复绘制。
+        /// </summary>
         private Texture2D GetThumbnail(string path)
         {
             if (_thumbnailCache.TryGetValue(path, out var cached))
                 return cached;
 
             Texture2D tex = null;
-
-            // Always load from raw file bytes to preserve original image dimensions.
-            // AssetDatabase.LoadAssetAtPath returns Unity-imported textures which may
-            // have power-of-two dimensions, causing aspect ratio distortion.
             if (File.Exists(path))
             {
                 try
@@ -938,6 +896,7 @@ namespace ImageSimilarityPlugin
             return tex;
         }
 
+        /// <summary>清除缩略图缓存，释放所有内存中的纹理对象</summary>
         private void ClearThumbnailCache()
         {
             foreach (var tex in _thumbnailCache.Values)
@@ -948,23 +907,5 @@ namespace ImageSimilarityPlugin
             _thumbnailCache.Clear();
         }
 
-        private void PingAsset(string path)
-        {
-            string assetPath = AbsoluteToAssetPath(path);
-            if (!string.IsNullOrEmpty(assetPath))
-            {
-                var obj = AssetDatabase.LoadMainAssetAtPath(assetPath);
-                if (obj != null)
-                {
-                    EditorGUIUtility.PingObject(obj);
-                    Selection.activeObject = obj;
-                }
-            }
-            else
-            {
-                // Outside the project — reveal in file explorer
-                EditorUtility.RevealInFinder(path);
-            }
-        }
     }
 }

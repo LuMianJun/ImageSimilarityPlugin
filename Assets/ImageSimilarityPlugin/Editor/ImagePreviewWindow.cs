@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Reflection;
 using UnityEditor;
 using UnityEngine;
 using UnityEngine.UI;
@@ -9,63 +8,39 @@ using UnityEngine.UI;
 namespace ImageSimilarityPlugin
 {
     /// <summary>
-    /// Large preview window opened when clicking a thumbnail in the results.
-    /// Supports "keep this image and replace all references in prefabs" workflow.
+    /// 大图预览窗口。
+    /// 从主窗口点击缩略图时以模态窗口打开。
+    /// 支持大图预览、同组缩略图切换、文件信息、FR2 引用角标，
+    /// 以及"保留此图片并替换所有 Prefab 中 Image.sprite 引用"的核心工作流。
     /// </summary>
     public class ImagePreviewWindow : EditorWindow
     {
-        // --- Passed-in data ---
         private DuplicateGroup _group;
         private int _selectedIndex;
-        private Action _onRefreshParent; // callback to refresh parent window after delete
+        private Action _onRefreshParent;
 
-        // --- Cache ---
         private Dictionary<string, Texture2D> _thumbCache = new Dictionary<string, Texture2D>();
         private Texture2D _largePreview;
         private string _largePreviewPath;
 
-        // --- UI state ---
-        private Vector2 _scrollInfo;
         private Vector2 _thumbScroll;
         private string _statusMsg = "";
         private bool _statusIsError;
         private bool _isReplacing;
 
-        // --- Reference finder cache ---
-        private static bool? _fr2Available;
-
-        /// <summary>
-        /// Whether FR2 is installed and its cache is populated (ready for queries).
-        /// </summary>
-        public static bool IsFR2Ready
-        {
-            get
-            {
-                if (!HasFR2()) return false;
-                try
-                {
-                    Type fr2CacheType = FindTypeInAllAssemblies("FR2_Cache");
-                    var apiProp = fr2CacheType.GetProperty("Api",
-                        BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Public);
-                    var cache = apiProp?.GetValue(null);
-                    var assetMapField = cache?.GetType().GetField("AssetMap",
-                        BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
-                    var assetMap = assetMapField?.GetValue(cache);
-                    var countProp = assetMap?.GetType().GetProperty("Count");
-                    return (int)(countProp?.GetValue(assetMap) ?? 0) > 0;
-                }
-                catch { return false; }
-            }
-        }
-        private static Dictionary<string, int> _refCountCache = new Dictionary<string, int>();
-
         private const int THUMB_HEIGHT = 80;
         private const int MAX_PREVIEW_SIZE = 512;
 
         // ==================================================================
-        //  Open
+        //  打开 / 关闭
         // ==================================================================
 
+        /// <summary>
+        /// 打开图片预览窗口。
+        /// </summary>
+        /// <param name="group">图片组数据</param>
+        /// <param name="selectedIndex">初始选中图片在组内的索引</param>
+        /// <param name="onRefreshParent">操作完成后刷新父窗口的回调</param>
         public static void Open(DuplicateGroup group, int selectedIndex, Action onRefreshParent = null)
         {
             var win = GetWindow<ImagePreviewWindow>(true, "图片预览");
@@ -80,79 +55,63 @@ namespace ImageSimilarityPlugin
             win.Show();
         }
 
-        private void OnDisable()
-        {
-            ClearCache();
-        }
+        private void OnDisable() => ClearCache();
 
         // ==================================================================
-        //  GUI
+        //  主 GUI 布局
         // ==================================================================
 
         private void OnGUI()
         {
-            if (_group == null)
-            {
-                EditorGUILayout.LabelField("无数据。");
-                return;
-            }
+            if (_group == null) { EditorGUILayout.LabelField("无数据。"); return; }
 
-            // --- Top: large preview + info ---
             DrawLargePreview();
-
             EditorGUILayout.Space(4);
-
-            // --- Bottom: thumbnails row ---
             DrawThumbnailRow();
-
             EditorGUILayout.Space(4);
+            DrawStatus();
+            EditorGUILayout.Space(4);
+            DrawActions();
+        }
 
-            // --- Status ---
+        private void DrawStatus()
+        {
             if (!string.IsNullOrEmpty(_statusMsg))
             {
                 GUI.color = _statusIsError ? Color.red : Color.white;
                 EditorGUILayout.LabelField(_statusMsg, EditorStyles.wordWrappedLabel);
                 GUI.color = Color.white;
             }
-
-            EditorGUILayout.Space(4);
-
-            // --- Actions ---
-            DrawActions();
         }
 
         // ==================================================================
-        //  Large Preview
+        //  大图预览
         // ==================================================================
 
+        /// <summary>
+        /// 绘制左侧大图预览和右侧文件信息。
+        /// 图片按原始宽高比缩放，最大不超过 MAX_PREVIEW_SIZE。
+        /// </summary>
         private void DrawLargePreview()
         {
             string currentPath = _group.images[_selectedIndex];
 
-            // Load full-size texture
             if (_largePreviewPath != currentPath)
             {
                 if (_largePreview != null && !_thumbCache.ContainsValue(_largePreview))
                     DestroyImmediate(_largePreview);
-
                 _largePreview = LoadTexture(currentPath);
                 _largePreviewPath = currentPath;
             }
 
             EditorGUILayout.BeginHorizontal();
 
-            // Preview area
             if (_largePreview != null)
             {
-                float texW = _largePreview.width;
-                float texH = _largePreview.height;
-                float maxDim = Mathf.Max(texW, texH);
-                float scale = Mathf.Min(1f, MAX_PREVIEW_SIZE / maxDim);
-                float drawW = texW * scale;
-                float drawH = texH * scale;
-
-                Rect previewRect = GUILayoutUtility.GetRect(drawW, drawH, GUILayout.Width(drawW), GUILayout.Height(drawH));
-                GUI.DrawTexture(previewRect, _largePreview, ScaleMode.ScaleToFit);
+                float scale = Mathf.Min(1f, MAX_PREVIEW_SIZE / Mathf.Max(_largePreview.width, _largePreview.height));
+                Rect r = GUILayoutUtility.GetRect(_largePreview.width * scale, _largePreview.height * scale,
+                    GUILayout.Width(_largePreview.width * scale), GUILayout.Height(_largePreview.height * scale));
+                GUI.DrawTexture(r, _largePreview, ScaleMode.ScaleToFit);
             }
             else
             {
@@ -160,25 +119,28 @@ namespace ImageSimilarityPlugin
             }
 
             GUILayout.Space(10);
+            DrawFileInfo(currentPath);
+            EditorGUILayout.EndHorizontal();
+        }
 
-            // File info
+        /// <summary>
+        /// 绘制右侧文件信息：文件名、尺寸、文件大小、修改时间、组内序号、"在 Project 中定位"按钮。
+        /// </summary>
+        private void DrawFileInfo(string currentPath)
+        {
             EditorGUILayout.BeginVertical(GUILayout.Width(220));
             EditorGUILayout.LabelField("文件信息", EditorStyles.boldLabel);
-
-            string shortName = Path.GetFileName(currentPath);
-            EditorGUILayout.LabelField("文件名:", shortName);
+            EditorGUILayout.LabelField("文件名:", Path.GetFileName(currentPath));
 
             if (_largePreview != null)
-            {
                 EditorGUILayout.LabelField($"尺寸: {_largePreview.width} × {_largePreview.height}");
-            }
 
             try
             {
                 var fi = new FileInfo(currentPath);
                 if (fi.Exists)
                 {
-                    EditorGUILayout.LabelField($"文件大小: {FormatFileSize(fi.Length)}");
+                    EditorGUILayout.LabelField($"文件大小: {PluginUtils.FormatFileSize(fi.Length)}");
                     EditorGUILayout.LabelField($"修改时间: {fi.LastWriteTime:yyyy-MM-dd HH:mm}");
                 }
             }
@@ -187,29 +149,27 @@ namespace ImageSimilarityPlugin
             EditorGUILayout.LabelField($"组内序号: {_selectedIndex + 1} / {_group.images.Count}");
 
             if (GUILayout.Button("在 Project 中定位"))
-            {
-                PingAsset(currentPath);
-            }
+                PluginUtils.PingAsset(currentPath);
 
             EditorGUILayout.EndVertical();
-
-            EditorGUILayout.EndHorizontal();
         }
 
         // ==================================================================
-        //  Thumbnail Row
+        //  缩略图行
         // ==================================================================
 
+        /// <summary>
+        /// 绘制底部水平滚动缩略图行。
+        /// 当前选中图片有蓝色高亮背景，每张缩略图显示 FR2 角标。
+        /// 点击缩略图切换大图预览。
+        /// </summary>
         private void DrawThumbnailRow()
         {
             EditorGUILayout.LabelField("同组图片 — 点击切换预览", EditorStyles.boldLabel);
 
-            float slotWidth = THUMB_HEIGHT + 14;
-            float totalWidth = _group.images.Count * slotWidth + 4;
+            float totalWidth = _group.images.Count * (THUMB_HEIGHT + 14) + 4;
 
-            // Horizontal scroll so all images are reachable even in narrow windows
-            _thumbScroll = EditorGUILayout.BeginScrollView(
-                _thumbScroll, false, true,
+            _thumbScroll = EditorGUILayout.BeginScrollView(_thumbScroll, false, true,
                 GUILayout.Height(THUMB_HEIGHT + 38));
             EditorGUILayout.BeginHorizontal(GUILayout.Width(totalWidth));
 
@@ -218,28 +178,23 @@ namespace ImageSimilarityPlugin
                 string path = _group.images[i];
                 bool isActive = (i == _selectedIndex);
 
-                // Highlight active
                 Color bg = isActive ? new Color(0.3f, 0.6f, 1f, 0.4f) : Color.clear;
                 Rect rowRect = EditorGUILayout.BeginVertical(GUILayout.Width(THUMB_HEIGHT + 12));
-                if (isActive)
-                    EditorGUI.DrawRect(rowRect, bg);
+                if (isActive) EditorGUI.DrawRect(rowRect, bg);
 
-                // Thumbnail
                 Texture2D thumb = GetOrLoadThumb(path);
                 Rect thumbR = GUILayoutUtility.GetRect(THUMB_HEIGHT, THUMB_HEIGHT,
                     GUILayout.Width(THUMB_HEIGHT), GUILayout.Height(THUMB_HEIGHT));
+
                 if (thumb != null)
                 {
                     float a = (float)thumb.width / Mathf.Max(1, thumb.height);
-                    float dw, dh;
-                    if (a >= 1) { dw = THUMB_HEIGHT; dh = THUMB_HEIGHT / a; }
-                    else { dh = THUMB_HEIGHT; dw = THUMB_HEIGHT * a; }
-                    Rect dr = new Rect(thumbR.x + (THUMB_HEIGHT - dw) / 2,
-                                       thumbR.y + (THUMB_HEIGHT - dh) / 2, dw, dh);
-                    GUI.DrawTexture(dr, thumb, ScaleMode.StretchToFill);
+                    float dw = a >= 1 ? THUMB_HEIGHT : THUMB_HEIGHT * a;
+                    float dh = a >= 1 ? THUMB_HEIGHT / a : THUMB_HEIGHT;
+                    GUI.DrawTexture(new Rect(thumbR.x + (THUMB_HEIGHT - dw) / 2,
+                        thumbR.y + (THUMB_HEIGHT - dh) / 2, dw, dh), thumb, ScaleMode.StretchToFill);
                 }
 
-                // Click → switch preview
                 if (GUI.Button(thumbR, GUIContent.none, GUIStyle.none))
                 {
                     _selectedIndex = i;
@@ -248,10 +203,7 @@ namespace ImageSimilarityPlugin
                     Repaint();
                 }
 
-                // FR2 badge
-                DrawRefCountBadge(thumbR, path);
-
-                // Filename
+                FR2Integration.DrawRefCountBadge(thumbR, path);
                 EditorGUILayout.LabelField(Path.GetFileName(path), EditorStyles.centeredGreyMiniLabel,
                     GUILayout.Width(THUMB_HEIGHT + 8));
 
@@ -264,23 +216,24 @@ namespace ImageSimilarityPlugin
         }
 
         // ==================================================================
-        //  Actions
+        //  操作按钮
         // ==================================================================
 
+        /// <summary>
+        /// 绘制底部操作按钮："保留此图片并替换所有引用"。
+        /// 先弹出确认对话框，用户确认后启动替换流程。
+        /// </summary>
         private void DrawActions()
         {
             EditorGUILayout.BeginHorizontal();
             GUILayout.FlexibleSpace();
-
             GUI.enabled = !_isReplacing;
 
-            // Keep this image & replace references to others
             if (GUILayout.Button("保留此图片并替换所有引用", GUILayout.Height(30), GUILayout.Width(220)))
             {
                 if (EditorUtility.DisplayDialog("确认操作",
                     $"将保留:\n  {Path.GetFileName(_group.images[_selectedIndex])}\n\n" +
-                    "会找到所有 Prefab 中引用同组其他图片的 Image.sprite，\n" +
-                    "替换为这张保留的图片。\n\n继续？",
+                    "会找到所有 Prefab 中引用同组其他图片的 Image.sprite，替换为这张保留的图片。\n\n继续？",
                     "确认", "取消"))
                 {
                     ReplaceReferences();
@@ -292,9 +245,15 @@ namespace ImageSimilarityPlugin
         }
 
         // ==================================================================
-        //  Reference Replacement
+        //  引用替换
         // ==================================================================
 
+        /// <summary>
+        /// 执行"保留此图并替换所有引用"的核心逻辑：
+        /// 加载保留图 Sprite → 查找所有引用同组其他图片的 Prefab →
+        /// 逐个替换 Image.sprite → 保存 Prefab 并报告结果。
+        /// 引用查找优先使用 FR2，回退到原生扫描。
+        /// </summary>
         private void ReplaceReferences()
         {
             _isReplacing = true;
@@ -309,16 +268,11 @@ namespace ImageSimilarityPlugin
                     string keepPath = _group.images[_selectedIndex];
                     var oldPaths = new List<string>();
                     for (int i = 0; i < _group.images.Count; i++)
-                    {
-                        if (i != _selectedIndex)
-                            oldPaths.Add(_group.images[i]);
-                    }
+                        if (i != _selectedIndex) oldPaths.Add(_group.images[i]);
 
-                    // Load the keep sprite
-                    string keepAssetPath = AbsoluteToAssetPath(keepPath);
-                    Sprite keepSprite = null;
-                    if (!string.IsNullOrEmpty(keepAssetPath))
-                        keepSprite = AssetDatabase.LoadAssetAtPath<Sprite>(keepAssetPath);
+                    string keepAssetPath = PluginUtils.AbsoluteToAssetPath(keepPath);
+                    Sprite keepSprite = string.IsNullOrEmpty(keepAssetPath) ? null
+                        : AssetDatabase.LoadAssetAtPath<Sprite>(keepAssetPath);
 
                     if (keepSprite == null)
                     {
@@ -329,8 +283,8 @@ namespace ImageSimilarityPlugin
                         return;
                     }
 
-                    // Find prefabs referencing the OLD images
-                    var prefabsToFix = FindPrefabsReferencing(oldPaths);
+                    var prefabsToFix = FR2Integration.FindPrefabsReferencing(oldPaths,
+                        (i, total) => { _statusMsg = $"查找引用中... ({i}/{total})"; Repaint(); });
                     if (prefabsToFix.Count == 0)
                     {
                         _statusMsg = "未找到任何 Prefab 引用同组的其他图片，无需替换。";
@@ -340,7 +294,6 @@ namespace ImageSimilarityPlugin
                         return;
                     }
 
-                    // Replace in each prefab
                     int replacedCount = 0;
                     int totalComponents = 0;
 
@@ -352,57 +305,31 @@ namespace ImageSimilarityPlugin
 
                         try
                         {
-                            // Load prefab contents for editing
-                            GameObject prefabRoot = PrefabUtility.LoadPrefabContents(prefabPath);
+                            GameObject root = PrefabUtility.LoadPrefabContents(prefabPath);
                             bool modified = false;
 
-                            // Find all Image components
-                            Image[] images = prefabRoot.GetComponentsInChildren<Image>(true);
-                            foreach (var img in images)
+                            foreach (var img in root.GetComponentsInChildren<Image>(true))
                             {
                                 if (img.sprite == null) continue;
+                                string texPath = AssetDatabase.GetAssetPath(img.sprite);
+                                if (string.IsNullOrEmpty(texPath)) continue;
+                                string fullPath = Path.GetFullPath(Path.Combine(Application.dataPath, "..", texPath));
 
-                                string spriteTexPath = AssetDatabase.GetAssetPath(img.sprite);
-                                if (string.IsNullOrEmpty(spriteTexPath)) continue;
-
-                                string spriteFullPath = Path.GetFullPath(
-                                    Path.Combine(Application.dataPath, "..", spriteTexPath));
-
-                                // Check if this sprite comes from an old image
                                 foreach (var oldPath in oldPaths)
-                                {
-                                    if (PathsEqual(spriteFullPath, oldPath))
-                                    {
-                                        img.sprite = keepSprite;
-                                        EditorUtility.SetDirty(img);
-                                        modified = true;
-                                        totalComponents++;
-                                        break;
-                                    }
-                                }
+                                    if (PluginUtils.PathsEqual(fullPath, oldPath))
+                                        { img.sprite = keepSprite; EditorUtility.SetDirty(img); modified = true; totalComponents++; break; }
                             }
 
-                            if (modified)
-                            {
-                                PrefabUtility.SaveAsPrefabAsset(prefabRoot, prefabPath);
-                                replacedCount++;
-                            }
-
-                            PrefabUtility.UnloadPrefabContents(prefabRoot);
+                            if (modified) { PrefabUtility.SaveAsPrefabAsset(root, prefabPath); replacedCount++; }
+                            PrefabUtility.UnloadPrefabContents(root);
                         }
-                        catch (Exception ex)
-                        {
-                            UnityEngine.Debug.LogError($"处理 Prefab 失败 ({prefabPath}): {ex.Message}");
-                        }
+                        catch (Exception ex) { Debug.LogError($"处理 Prefab 失败 ({prefabPath}): {ex.Message}"); }
                     }
 
                     AssetDatabase.SaveAssets();
                     AssetDatabase.Refresh();
-
                     _statusMsg = $"完成! 修改了 {replacedCount} 个 Prefab，共替换 {totalComponents} 个 Image.sprite 引用。";
                     _statusIsError = false;
-
-                    // Refresh parent if any
                     _onRefreshParent?.Invoke();
                 }
                 catch (Exception ex)
@@ -418,425 +345,22 @@ namespace ImageSimilarityPlugin
             };
         }
 
-        /// <summary>
-        /// Find all prefab asset paths that reference any of the given image paths.
-        /// Uses FR2 if available, otherwise falls back to native Unity API.
-        /// </summary>
-        private List<string> FindPrefabsReferencing(List<string> oldImagePaths)
-        {
-            // Convert absolute paths to asset paths
-            var oldAssetPaths = new HashSet<string>();
-            foreach (var p in oldImagePaths)
-            {
-                string ap = AbsoluteToAssetPath(p);
-                if (!string.IsNullOrEmpty(ap))
-                    oldAssetPaths.Add(ap);
-            }
-
-            if (oldAssetPaths.Count == 0)
-                return new List<string>();
-
-            // Try FR2 first
-            if (HasFR2())
-                return FindWithFR2(oldAssetPaths);
-
-            // Fallback: native scan
-            return FindWithNativeAPI(oldAssetPaths);
-        }
-
         // ==================================================================
-        //  FR2 Integration
+        //  纹理加载
         // ==================================================================
 
-        /// <summary>
-        /// Find a type by name across all loaded assemblies. Searches both full name
-        /// (namespace.TypeName) and simple name (TypeName) to handle namespace variations.
-        /// </summary>
-        private static Type FindTypeInAllAssemblies(string typeName)
-        {
-            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-            {
-                // Try full name first (e.g. "FR2_Cache")
-                var t = asm.GetType(typeName);
-                if (t != null) return t;
-
-                // Try with namespace prefix (e.g. "FR2.FR2_Cache" or "FindReference2.FR2_Cache")
-                t = asm.GetType("FR2." + typeName);
-                if (t != null) return t;
-                t = asm.GetType("FindReference2." + typeName);
-                if (t != null) return t;
-
-                // Fallback: iterate all types and match by simple name
-                try
-                {
-                    foreach (var exportedType in asm.GetExportedTypes())
-                    {
-                        if (exportedType.Name == typeName)
-                            return exportedType;
-                    }
-                }
-                catch { }
-            }
-            return null;
-        }
-
-        /// <summary>
-        /// Diagnostic: dump all loaded assemblies and any types matching a filter to Console.
-        /// Call from Unity's Console: ImageSimilarityPlugin.ImagePreviewWindow.DiagnoseFR2();
-        /// </summary>
-        [MenuItem("Tools/诊断 FR2 检测")]
-        public static void DiagnoseFR2()
-        {
-            UnityEngine.Debug.Log("=== FR2 诊断 ===");
-            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
-            UnityEngine.Debug.Log($"已加载程序集总数: {assemblies.Length}");
-
-            foreach (var asm in assemblies)
-            {
-                string name = asm.GetName().Name;
-                // Look for FR2 or FindReference related assemblies
-                if (name.IndexOf("FR2", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    name.IndexOf("FindReference", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    name.IndexOf("Find Ref", StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    UnityEngine.Debug.Log($"  ▶ 程序集: {name}   ({asm.GetTypes().Length} types)");
-                    foreach (var t in asm.GetTypes())
-                    {
-                        if (t.Name.Contains("FR2") || t.Name.Contains("Cache"))
-                            UnityEngine.Debug.Log($"      - {t.FullName}");
-                    }
-                }
-            }
-
-            // Also search for FR2_Cache in all assemblies
-            foreach (var asm in assemblies)
-            {
-                var t = asm.GetType("FR2_Cache");
-                if (t != null)
-                {
-                    UnityEngine.Debug.Log($"  ★ 找到 FR2_Cache 在: {asm.GetName().Name}");
-                    UnityEngine.Debug.Log($"      FullName: {t.FullName}");
-                    UnityEngine.Debug.Log($"      Namespace: {t.Namespace}");
-                }
-            }
-
-            // Check for FR2 namespace variations
-            string[] typeNames = { "FR2_Cache", "FR2Cache", "FR2.FR2_Cache", "FindReference2.FR2_Cache" };
-            foreach (var tn in typeNames)
-            {
-                var t = FindTypeInAllAssemblies(tn);
-                if (t != null)
-                    UnityEngine.Debug.Log($"  ✓ 找到: {tn} in assembly {t.Assembly.GetName().Name}");
-                else
-                    UnityEngine.Debug.Log($"  ✗ 未找到: {tn}");
-            }
-
-            UnityEngine.Debug.Log("=== 诊断完毕 ===");
-        }
-
-        /// <summary>
-        /// True if FR2 (Find Reference 2) is installed in this project.
-        /// Key API:
-        ///   FR2_Cache.Api.AssetMap[guid]  → FR2_Asset
-        ///   FR2_Asset.FindUsedBy(asset)   → List&lt;FR2_Asset&gt; (who references this)
-        ///   FR2_Asset.assetPath           → string
-        /// </summary>
-        public static bool HasFR2()
-        {
-            if (_fr2Available.HasValue) return _fr2Available.Value;
-
-            // Search all loaded assemblies for FR2_Cache
-            Type fr2CacheType = FindTypeInAllAssemblies("FR2_Cache");
-            if (fr2CacheType == null)
-            {
-                UnityEngine.Debug.Log("[ImageSimilarityPlugin] FR2 未检测到。");
-                _fr2Available = false;
-                return false;
-            }
-
-            // Verify we can access Api . AssetMap
-            try
-            {
-                var apiProp = fr2CacheType.GetProperty("Api",
-                    BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Public);
-                if (apiProp == null) { _fr2Available = false; return false; }
-
-                var cache = apiProp.GetValue(null);
-                if (cache == null) { _fr2Available = false; return false; }
-
-                var assetMapField = cache.GetType().GetField("AssetMap",
-                    BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
-                if (assetMapField == null) { _fr2Available = false; return false; }
-
-                UnityEngine.Debug.Log("[ImageSimilarityPlugin] FR2 已检测到并可用。");
-                _fr2Available = true;
-                return true;
-            }
-            catch (Exception ex)
-            {
-                UnityEngine.Debug.LogWarning($"[ImageSimilarityPlugin] FR2 检测异常: {ex.Message}");
-                _fr2Available = false;
-                return false;
-            }
-        }
-
-        private List<string> FindWithFR2(HashSet<string> oldAssetPaths)
-        {
-            var result = new HashSet<string>();
-
-            try
-            {
-                Type fr2CacheType = FindTypeInAllAssemblies("FR2_Cache");
-                if (fr2CacheType == null) return FindWithNativeAPI(oldAssetPaths);
-
-                // FR2_Cache.Api → cache instance
-                var apiProp = fr2CacheType.GetProperty("Api",
-                    BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Public);
-                var cache = apiProp?.GetValue(null);
-                if (cache == null) return FindWithNativeAPI(oldAssetPaths);
-
-                // cache.AssetMap → Dictionary<string, FR2_Asset>
-                var assetMapField = cache.GetType().GetField("AssetMap",
-                    BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
-                var assetMap = assetMapField?.GetValue(cache);
-                if (assetMap == null) return FindWithNativeAPI(oldAssetPaths);
-
-                // Find the indexer or TryGetValue on the dictionary
-                var tryGetMethod = assetMap.GetType().GetMethod("TryGetValue");
-                var indexerProp = assetMap.GetType().GetProperty("Item");
-
-                // FR2_Asset.FindUsedBy(FR2_Asset) → List<FR2_Asset>
-                Type fr2AssetType = null;
-                System.Reflection.MethodInfo findUsedByMethod = null;
-
-                foreach (var assetPath in oldAssetPaths)
-                {
-                    try
-                    {
-                        string guid = AssetDatabase.AssetPathToGUID(assetPath);
-                        if (string.IsNullOrEmpty(guid)) continue;
-
-                        // assetMap[guid] → FR2_Asset
-                        object fr2Asset = null;
-                        if (indexerProp != null)
-                        {
-                            fr2Asset = indexerProp.GetValue(assetMap, new object[] { guid });
-                        }
-                        else if (tryGetMethod != null)
-                        {
-                            var args = new object[] { guid, null };
-                            if ((bool)tryGetMethod.Invoke(assetMap, args))
-                                fr2Asset = args[1];
-                        }
-                        if (fr2Asset == null) continue;
-
-                        // Cache the type and method reference
-                        if (fr2AssetType == null)
-                        {
-                            fr2AssetType = fr2Asset.GetType();
-                            findUsedByMethod = fr2AssetType.GetMethod("FindUsedBy",
-                                BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Public);
-                        }
-
-                        if (findUsedByMethod == null) continue;
-
-                        // FR2_Asset.FindUsedBy(asset) → List<FR2_Asset>
-                        var usedByList = findUsedByMethod.Invoke(null, new[] { fr2Asset })
-                            as System.Collections.IList;
-                        if (usedByList == null || usedByList.Count == 0) continue;
-
-                        // Extract assetPath from each FR2_Asset
-                        var pathField = fr2AssetType.GetField("assetPath",
-                            BindingFlags.Public | BindingFlags.Instance);
-
-                        foreach (var item in usedByList)
-                        {
-                            string refPath = pathField?.GetValue(item) as string;
-                            if (!string.IsNullOrEmpty(refPath) &&
-                                refPath.EndsWith(".prefab", StringComparison.OrdinalIgnoreCase))
-                            {
-                                result.Add(refPath);
-                            }
-                        }
-                    }
-                    catch { }
-                }
-            }
-            catch { }
-
-            if (result.Count > 0)
-            {
-                UnityEngine.Debug.Log($"[ImageSimilarityPlugin] FR2 找到 {result.Count} 个引用 Prefab。");
-                return new List<string>(result);
-            }
-
-            // If FR2 found nothing (cache may be stale), fall back to native
-            return FindWithNativeAPI(oldAssetPaths);
-        }
-
-        /// <summary>
-        /// Get the number of assets (prefabs, scenes, etc.) that reference this image.
-        /// Returns 0 if FR2 is not available or the asset is unused.
-        /// Results are cached for the session.
-        /// </summary>
-        public static int GetReferenceCount(string absolutePath)
-        {
-            if (!HasFR2()) return 0;
-
-            string assetPath = AbsoluteToAssetPath(absolutePath);
-            if (string.IsNullOrEmpty(assetPath)) return 0;
-
-            if (_refCountCache.TryGetValue(assetPath, out int cached))
-                return cached;
-
-            int count = 0;
-            try
-            {
-                Type fr2CacheType = FindTypeInAllAssemblies("FR2_Cache");
-                if (fr2CacheType == null) { _refCountCache[assetPath] = 0; return 0; }
-
-                var apiProp = fr2CacheType.GetProperty("Api",
-                    BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Public);
-                var cache = apiProp?.GetValue(null);
-                if (cache == null) { _refCountCache[assetPath] = 0; return 0; }
-
-                var assetMapField = cache.GetType().GetField("AssetMap",
-                    BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
-                var assetMap = assetMapField?.GetValue(cache);
-                if (assetMap == null) { _refCountCache[assetPath] = 0; return 0; }
-
-                string guid = AssetDatabase.AssetPathToGUID(assetPath);
-                if (string.IsNullOrEmpty(guid)) { _refCountCache[assetPath] = 0; return 0; }
-
-                var indexerProp = assetMap.GetType().GetProperty("Item");
-                object fr2Asset = indexerProp?.GetValue(assetMap, new object[] { guid });
-
-                if (fr2Asset == null) { _refCountCache[assetPath] = 0; return 0; }
-
-                var findUsedByMethod = fr2Asset.GetType().GetMethod("FindUsedBy",
-                    BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Public);
-                if (findUsedByMethod != null)
-                {
-                    var usedByList = findUsedByMethod.Invoke(null, new[] { fr2Asset })
-                        as System.Collections.IList;
-                    count = usedByList?.Count ?? 0;
-                }
-                else
-                {
-                    // Fallback: check UsedByMap field directly
-                    var usedByMapField = fr2Asset.GetType().GetField("UsedByMap",
-                        BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Public);
-                    if (usedByMapField != null)
-                    {
-                        var usedByMap = usedByMapField.GetValue(fr2Asset);
-                        var countProp = usedByMap?.GetType().GetProperty("Count");
-                        count = (int)(countProp?.GetValue(usedByMap) ?? 0);
-                    }
-                }
-            }
-            catch { }
-
-            _refCountCache[assetPath] = count;
-            return count;
-        }
-
-        /// <summary>
-        /// Clear the reference count cache (call after FR2 cache rebuild).
-        /// </summary>
-        public static void ClearRefCountCache()
-        {
-            _refCountCache.Clear();
-        }
-
-        /// <summary>
-        /// Draw an FR2 reference-count badge in the top-right corner of a thumbnail rect.
-        /// </summary>
-        public static void DrawRefCountBadge(Rect thumbRect, string imagePath)
-        {
-            if (!HasFR2()) return;
-
-            int count = GetReferenceCount(imagePath);
-            if (count <= 0) return;
-
-            // Badge background (small circle/square in top-right)
-            float badgeSize = 20f;
-            Rect badgeRect = new Rect(
-                thumbRect.xMax - badgeSize - 2,
-                thumbRect.y + 2,
-                badgeSize,
-                badgeSize);
-
-            // Draw circle background
-            Color oldColor = GUI.color;
-            GUI.color = new Color(0.2f, 0.5f, 0.9f, 0.85f);
-            GUI.Box(badgeRect, "", EditorStyles.helpBox);
-
-            // Draw count text
-            var labelStyle = new GUIStyle(EditorStyles.miniLabel)
-            {
-                alignment = TextAnchor.MiddleCenter,
-                fontStyle = FontStyle.Bold,
-                fontSize = 10,
-                normal = { textColor = Color.white }
-            };
-            GUI.color = Color.white;
-            GUI.Label(badgeRect, count > 99 ? "99+" : count.ToString(), labelStyle);
-            GUI.color = oldColor;
-        }
-
-        // ==================================================================
-        //  Native Reference Finding
-        // ==================================================================
-
-        private List<string> FindWithNativeAPI(HashSet<string> oldAssetPaths)
-        {
-            var result = new HashSet<string>();
-
-            // Get all prefab GUIDs
-            string[] prefabGuids = AssetDatabase.FindAssets("t:Prefab");
-            UnityEngine.Debug.Log($"[ImageSimilarityPlugin] 扫描 {prefabGuids.Length} 个 Prefab 查找引用...");
-
-            for (int i = 0; i < prefabGuids.Length; i++)
-            {
-                string prefabPath = AssetDatabase.GUIDToAssetPath(prefabGuids[i]);
-                if (string.IsNullOrEmpty(prefabPath)) continue;
-
-                // Show progress every 500 prefabs
-                if (i % 500 == 0)
-                {
-                    _statusMsg = $"查找引用中... ({i}/{prefabGuids.Length})";
-                    Repaint();
-                }
-
-                string[] deps = AssetDatabase.GetDependencies(prefabPath, false);
-                foreach (var dep in deps)
-                {
-                    if (oldAssetPaths.Contains(dep))
-                    {
-                        result.Add(prefabPath);
-                        break;
-                    }
-                }
-            }
-
-            UnityEngine.Debug.Log($"[ImageSimilarityPlugin] 原生扫描完成，找到 {result.Count} 个引用 Prefab。");
-            return new List<string>(result);
-        }
-
-        // ==================================================================
-        //  Helpers
-        // ==================================================================
-
+        /// <summary>从缓存获取缩略图，缓存未命中则加载</summary>
         private Texture2D GetOrLoadThumb(string path)
         {
-            if (_thumbCache.TryGetValue(path, out var cached) && cached != null)
-                return cached;
-
+            if (_thumbCache.TryGetValue(path, out var cached) && cached != null) return cached;
             var tex = LoadTexture(path);
             _thumbCache[path] = tex;
             return tex;
         }
 
+        /// <summary>
+        /// 从原始文件字节加载纹理（而非 Unity 导入版本），确保宽高比正确。
+        /// </summary>
         private Texture2D LoadTexture(string path)
         {
             if (!File.Exists(path)) return null;
@@ -847,18 +371,14 @@ namespace ImageSimilarityPlugin
                 tex.LoadImage(data);
                 return tex;
             }
-            catch
-            {
-                return null;
-            }
+            catch { return null; }
         }
 
+        /// <summary>释放所有缓存的纹理对象</summary>
         private void ClearCache()
         {
             foreach (var tex in _thumbCache.Values)
-            {
                 if (tex != null) DestroyImmediate(tex);
-            }
             _thumbCache.Clear();
 
             if (_largePreview != null && !_thumbCache.ContainsValue(_largePreview))
@@ -867,50 +387,6 @@ namespace ImageSimilarityPlugin
                 _largePreview = null;
                 _largePreviewPath = null;
             }
-        }
-
-        private void PingAsset(string path)
-        {
-            string ap = AbsoluteToAssetPath(path);
-            if (!string.IsNullOrEmpty(ap))
-            {
-                var obj = AssetDatabase.LoadMainAssetAtPath(ap);
-                if (obj != null)
-                {
-                    EditorGUIUtility.PingObject(obj);
-                    Selection.activeObject = obj;
-                }
-            }
-            else
-            {
-                EditorUtility.RevealInFinder(path);
-            }
-        }
-
-        private static string AbsoluteToAssetPath(string absolutePath)
-        {
-            string assetsRoot = Application.dataPath.Replace('/', Path.DirectorySeparatorChar);
-            string full = Path.GetFullPath(absolutePath);
-            if (!full.StartsWith(assetsRoot, StringComparison.OrdinalIgnoreCase))
-                return null;
-            string relative = full.Substring(assetsRoot.Length).TrimStart(Path.DirectorySeparatorChar);
-            return "Assets/" + relative.Replace('\\', '/');
-        }
-
-        private static bool PathsEqual(string a, string b)
-        {
-            return string.Equals(
-                Path.GetFullPath(a).TrimEnd(Path.DirectorySeparatorChar, '/'),
-                Path.GetFullPath(b).TrimEnd(Path.DirectorySeparatorChar, '/'),
-                StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static string FormatFileSize(long bytes)
-        {
-            if (bytes < 1024) return $"{bytes} B";
-            if (bytes < 1024 * 1024) return $"{bytes / 1024f:F1} KB";
-            if (bytes < 1024 * 1024 * 1024) return $"{bytes / (1024f * 1024f):F1} MB";
-            return $"{bytes / (1024f * 1024f * 1024f):F2} GB";
         }
     }
 }
