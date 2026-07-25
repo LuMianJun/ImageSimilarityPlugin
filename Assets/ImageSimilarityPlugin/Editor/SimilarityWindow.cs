@@ -30,6 +30,13 @@ namespace ImageSimilarityPlugin
         private bool _checkingDeps = false;
         private bool _fr2Ready = false;
 
+        // --- Cache ---
+        private static string CacheDir => Path.Combine(Application.temporaryCachePath, "ImageSimilarityPlugin");
+        private string _cachePath;         // path to the cache file for current folder
+        private string _lastCheckedFolder; // track folder changes for cache re-check
+        private bool _hasCache;            // valid cache exists
+        private string _cacheInfo;         // display info about the cache
+
         // --- Results UI ---
         private Vector2 _scrollPos;
         private Dictionary<int, HashSet<int>> _selectedForDeletion = new Dictionary<int, HashSet<int>>(); // groupId -> set of image indices
@@ -89,10 +96,14 @@ namespace ImageSimilarityPlugin
             }
 
             _fr2Ready = ImagePreviewWindow.IsFR2Ready;
+            CheckCache();
         }
 
         private void OnGUI()
         {
+            // Re-check cache when folder changes
+            CheckCache();
+
             // --- Environment status bar ---
             DrawEnvironmentBar();
 
@@ -291,6 +302,38 @@ namespace ImageSimilarityPlugin
                 EditorGUILayout.LabelField(_statusMessage, EditorStyles.wordWrappedLabel);
                 GUI.color = Color.white;
             }
+
+            // Cache hint
+            if (_hasCache && _results == null && !_runner.IsRunning)
+            {
+                EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
+                GUI.color = new Color(0.5f, 0.8f, 0.5f);
+                EditorGUILayout.LabelField($" 上次扫描缓存可用 — {_cacheInfo}", GUILayout.ExpandWidth(true));
+                GUI.color = Color.white;
+                if (GUILayout.Button("加载缓存", GUILayout.Width(80), GUILayout.Height(20)))
+                {
+                    LoadCache();
+                }
+                EditorGUILayout.EndHorizontal();
+            }
+
+            // Clear cache button (when results are from cache)
+            if (_results != null && _hasCache && !_runner.IsRunning)
+            {
+                EditorGUILayout.BeginHorizontal();
+                GUILayout.FlexibleSpace();
+                GUI.color = Color.gray;
+                bool fromCache = _statusMessage != null && _statusMessage.Contains("缓存");
+                if (GUILayout.Button(fromCache ? "这些是缓存数据，点击重新扫描" : "清除缓存", EditorStyles.miniLabel))
+                {
+                    DeleteCache();
+                    _results = null;
+                    _statusMessage = "缓存已清除，可以重新扫描。";
+                    Repaint();
+                }
+                GUI.color = Color.white;
+                EditorGUILayout.EndHorizontal();
+            }
         }
 
         // ==================================================================
@@ -463,6 +506,7 @@ namespace ImageSimilarityPlugin
                     _results = result;
                     _statusMessage = $"扫描完成：找到 {result.total_groups} 组相似图片。";
                     _statusIsError = false;
+                    SaveCache(result);
                     Repaint();
                 },
                 onError: error =>
@@ -690,6 +734,119 @@ namespace ImageSimilarityPlugin
             _isInstalling = false;
             _installLog = "";
             try { if (_installProcess != null && !_installProcess.HasExited) _installProcess.Kill(); } catch { }
+        }
+
+        // ==================================================================
+        //  Cache
+        // ==================================================================
+
+        private void CheckCache()
+        {
+            if (_folderPath == _lastCheckedFolder) return;
+            _lastCheckedFolder = _folderPath;
+
+            _cachePath = GetCacheFilePath();
+            if (File.Exists(_cachePath))
+            {
+                try
+                {
+                    string json = File.ReadAllText(_cachePath, Encoding.UTF8);
+                    var meta = JsonUtility.FromJson<CacheMeta>(json);
+                    if (meta != null && meta.folder == _folderPath)
+                    {
+                        _hasCache = true;
+                        _cacheInfo = $"{meta.total_groups} 组 | 阈值: {meta.threshold:F2} | {meta.date}";
+                        return;
+                    }
+                }
+                catch { }
+            }
+            _hasCache = false;
+            _cacheInfo = "";
+        }
+
+        private void SaveCache(ScanResultData result)
+        {
+            try
+            {
+                Directory.CreateDirectory(CacheDir);
+                var meta = JsonUtility.ToJson(new CacheMeta
+                {
+                    folder = _folderPath,
+                    threshold = _threshold,
+                    total_images = result.total_images,
+                    total_groups = result.total_groups,
+                    date = DateTime.Now.ToString("yyyy-MM-dd HH:mm"),
+                }, true);
+                File.WriteAllText(_cachePath, meta, Encoding.UTF8);
+
+                // Also save full results alongside
+                string resultPath = _cachePath.Replace(".json", "_result.json");
+                string resultJson = JsonUtility.ToJson(result, true);
+                File.WriteAllText(resultPath, resultJson, Encoding.UTF8);
+
+                _hasCache = true;
+                _cacheInfo = $"{result.total_groups} 组 | 阈值: {_threshold:F2} | {DateTime.Now:yyyy-MM-dd HH:mm}";
+            }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogWarning($"[ImageSimilarityPlugin] 缓存保存失败: {ex.Message}");
+            }
+        }
+
+        private void LoadCache()
+        {
+            string resultPath = _cachePath.Replace(".json", "_result.json");
+            if (!File.Exists(resultPath)) return;
+
+            try
+            {
+                string json = File.ReadAllText(resultPath, Encoding.UTF8);
+                _results = JsonUtility.FromJson<ScanResultData>(json);
+                if (_results != null)
+                {
+                    _selectedForDeletion.Clear();
+                    ClearThumbnailCache();
+                    _statusMessage = $"已从缓存加载 — {_cacheInfo}";
+                    _statusIsError = false;
+                    Repaint();
+                }
+            }
+            catch (Exception ex)
+            {
+                _statusMessage = $"缓存加载失败: {ex.Message}";
+                _statusIsError = true;
+            }
+        }
+
+        private void DeleteCache()
+        {
+            try
+            {
+                if (File.Exists(_cachePath)) File.Delete(_cachePath);
+                string resultPath = _cachePath?.Replace(".json", "_result.json");
+                if (resultPath != null && File.Exists(resultPath)) File.Delete(resultPath);
+            }
+            catch { }
+            _hasCache = false;
+            _cacheInfo = "";
+        }
+
+        private string GetCacheFilePath()
+        {
+            // Generate a stable filename from the folder path
+            string hash = _folderPath.GetHashCode().ToString("X8");
+            return Path.Combine(CacheDir, $"scan_{hash}.json");
+        }
+
+        [Serializable]
+        private class CacheMeta
+        {
+            public string folder;
+            public float threshold;
+            public int total_images;
+            public int total_groups;
+            public string date;
         }
 
         // ==================================================================
