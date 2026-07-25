@@ -97,6 +97,24 @@ namespace ImageSimilarityPlugin
             if (_isInstalling)
             {
                 EditorGUILayout.Space(3);
+                EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+
+                // Title bar with close button
+                EditorGUILayout.BeginHorizontal();
+                EditorGUILayout.LabelField("安装日志", EditorStyles.boldLabel);
+                GUILayout.FlexibleSpace();
+                bool isRunning = _installProcess != null && !_installProcess.HasExited;
+                if (!isRunning)
+                {
+                    if (GUILayout.Button("关闭", EditorStyles.miniButton, GUILayout.Width(40)))
+                    {
+                        CloseInstallLog();
+                        EditorGUILayout.EndHorizontal();
+                        EditorGUILayout.EndVertical();
+                        return;
+                    }
+                }
+                EditorGUILayout.EndHorizontal();
 
                 // Progress bar
                 Rect barRect = EditorGUILayout.GetControlRect(false, 22);
@@ -108,7 +126,6 @@ namespace ImageSimilarityPlugin
                 // Scrollable log
                 if (!string.IsNullOrEmpty(_installLog))
                 {
-                    EditorGUILayout.LabelField("安装日志", EditorStyles.boldLabel);
                     float logHeight = Mathf.Min(200, EditorGUIUtility.currentViewWidth * 0.4f);
                     _installLogScrollPos = EditorGUILayout.BeginScrollView(
                         _installLogScrollPos, GUILayout.Height(logHeight));
@@ -116,6 +133,8 @@ namespace ImageSimilarityPlugin
                         GUILayout.ExpandHeight(true));
                     EditorGUILayout.EndScrollView();
                 }
+
+                EditorGUILayout.EndVertical();
             }
 
             EditorGUILayout.Space(5);
@@ -539,23 +558,33 @@ namespace ImageSimilarityPlugin
 
         private void InstallDependencies()
         {
-            string pythonPath = PythonLocator.GetPythonPath();
-            if (string.IsNullOrEmpty(pythonPath)) return;
-
-            string reqPath = Path.Combine(PythonRunner.GetPythonScriptsDir(), "requirements.txt");
-            if (!File.Exists(reqPath))
-            {
-                _statusMessage = $"未找到 requirements.txt: {reqPath}";
-                _statusIsError = true;
-                return;
-            }
-
             _isInstalling = true;
             _installProgress = 0f;
             _installLog = "";
             _installLogScrollPos = Vector2.zero;
             _statusMessage = "";
             _statusIsError = false;
+
+            string pythonPath = PythonLocator.GetPythonPath();
+            if (string.IsNullOrEmpty(pythonPath))
+            {
+                _installLog = "错误: 未找到 Python，无法安装依赖。\n请先在顶部点击"配置 Python"指定路径。";
+                _installProgress = 0f;
+                _isInstalling = true; // keep log visible
+                Repaint();
+                return;
+            }
+
+            string reqPath = Path.Combine(PythonRunner.GetPythonScriptsDir(), "requirements.txt");
+            if (!File.Exists(reqPath))
+            {
+                _installLog = $"错误: 未找到 requirements.txt\n路径: {reqPath}";
+                _installProgress = 0f;
+                _statusMessage = $"未找到 requirements.txt: {reqPath}";
+                _statusIsError = true;
+                Repaint();
+                return;
+            }
 
             try
             {
@@ -606,7 +635,6 @@ namespace ImageSimilarityPlugin
                 {
                     EditorApplication.delayCall += () =>
                     {
-                        _isInstalling = false;
                         _installProgress = 1f;
                         if (_installProcess.ExitCode == 0)
                         {
@@ -632,10 +660,23 @@ namespace ImageSimilarityPlugin
             }
             catch (Exception ex)
             {
-                _isInstalling = false;
+                _installLog += $"\n错误: {ex.Message}";
+                _installProgress = 0f;
                 _statusMessage = $"运行 pip 失败: {ex.Message}";
                 _statusIsError = true;
+                // keep _isInstalling = true so user can see the log
+                Repaint();
             }
+        }
+
+        /// <summary>
+        /// Close the install log panel.
+        /// </summary>
+        private void CloseInstallLog()
+        {
+            _isInstalling = false;
+            _installLog = "";
+            try { if (_installProcess != null && !_installProcess.HasExited) _installProcess.Kill(); } catch { }
         }
 
         // ==================================================================
