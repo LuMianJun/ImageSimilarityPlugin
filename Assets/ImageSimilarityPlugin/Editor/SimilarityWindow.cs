@@ -55,6 +55,7 @@ namespace ImageSimilarityPlugin
         // ===== 以图搜图参数 =====
         private string _queryImagePath = "";      // 查询图片的绝对路径
         private int _topK = 50;                   // 最大返回结果数
+        private int _queryPickerControlID;         // ObjectPicker 控件 ID
 
         // ===== 查询结果 =====
         private QueryResultData _queryResults;    // 查询结果
@@ -141,6 +142,35 @@ namespace ImageSimilarityPlugin
             EditorGUILayout.EndHorizontal();
         }
 
+        /// <summary>
+        /// 处理 Unity 原生 ObjectPicker 的选择事件。
+        /// 当用户在 Texture2D 选择器中选定资源后，解析为绝对路径。
+        /// </summary>
+        private void HandleObjectPicker()
+        {
+            if (Event.current == null) return;
+
+            string cmd = Event.current.commandName;
+            if (cmd == "ObjectSelectorUpdated" || cmd == "ObjectSelectorClosed")
+            {
+                int pickedControlID = EditorGUIUtility.GetObjectPickerControlID();
+                if (pickedControlID == _queryPickerControlID && _queryPickerControlID != 0)
+                {
+                    var picked = EditorGUIUtility.GetObjectPickerObject() as Sprite;
+                    if (picked != null)
+                    {
+                        string assetPath = AssetDatabase.GetAssetPath(picked);
+                        if (!string.IsNullOrEmpty(assetPath))
+                            _queryImagePath = Path.GetFullPath(Path.Combine(
+                                Application.dataPath, "..", assetPath));
+                    }
+                    if (cmd == "ObjectSelectorClosed")
+                        _queryPickerControlID = 0;
+                    Repaint();
+                }
+            }
+        }
+
         // ==================================================================
         //  主 GUI 布局
         // ==================================================================
@@ -158,6 +188,9 @@ namespace ImageSimilarityPlugin
                 DrawScanTab();
             else
                 DrawQueryTab();
+
+            // 处理 ObjectPicker 回调
+            HandleObjectPicker();
         }
 
         // ==================================================================
@@ -861,31 +894,27 @@ namespace ImageSimilarityPlugin
         {
             EditorGUILayout.LabelField("查询设置", EditorStyles.boldLabel);
 
-            // 查询图片 — 文件选择器
+            // 查询图片 — Unity 原生 ObjectPicker
             EditorGUILayout.BeginHorizontal();
             EditorGUILayout.LabelField("查询图片:", GUILayout.Width(60));
-            _queryImagePath = EditorGUILayout.TextField(_queryImagePath);
-            if (GUILayout.Button("浏览", GUILayout.Width(70)))
-            {
-                string selected = EditorUtility.OpenFilePanel("选择查询图片", _folderPath,
-                    "png,jpg,jpeg,bmp,gif,tiff,tif,webp");
-                if (!string.IsNullOrEmpty(selected))
-                    _queryImagePath = selected;
-            }
-            EditorGUILayout.EndHorizontal();
 
-            // 查询图片 — 从 Project 窗口拖入
-            EditorGUILayout.BeginHorizontal();
-            EditorGUILayout.LabelField("拖入资源:", GUILayout.Width(60));
-            Texture2D dragTex = (Texture2D)EditorGUILayout.ObjectField(null,
-                typeof(Texture2D), false, GUILayout.Height(40), GUILayout.Width(200));
-            if (dragTex != null)
+            string displayName = string.IsNullOrEmpty(_queryImagePath)
+                ? "未选择"
+                : Path.GetFileName(_queryImagePath);
+            EditorGUILayout.LabelField(displayName, EditorStyles.boldLabel);
+
+            if (GUILayout.Button("从项目中选择...", GUILayout.Width(120)))
             {
-                string assetPath = AssetDatabase.GetAssetPath(dragTex);
-                _queryImagePath = Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath));
+                _queryPickerControlID = GUIUtility.GetControlID(FocusType.Passive);
+                EditorGUIUtility.ShowObjectPicker<Sprite>(null, false, "", _queryPickerControlID);
             }
-            // 提示
-            EditorGUILayout.LabelField("从 Project 窗口拖入图片资源", EditorStyles.miniLabel);
+
+            if (!string.IsNullOrEmpty(_queryImagePath) && GUILayout.Button("×", GUILayout.Width(25)))
+            {
+                _queryImagePath = "";
+                Repaint();
+            }
+
             EditorGUILayout.EndHorizontal();
 
             // 目标文件夹
@@ -924,7 +953,9 @@ namespace ImageSimilarityPlugin
             EditorGUILayout.BeginHorizontal();
 
             bool canQuery = !string.IsNullOrEmpty(_pythonVersion) && _depsInstalled
-                && !_runner.IsRunning && File.Exists(_queryImagePath);
+                && !_runner.IsRunning
+                && !string.IsNullOrEmpty(_queryImagePath)
+                && File.Exists(_queryImagePath);
 
             GUI.enabled = canQuery;
             if (GUILayout.Button("开始搜索", GUILayout.Height(30), GUILayout.Width(120)))
