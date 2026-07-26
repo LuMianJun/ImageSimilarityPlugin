@@ -144,7 +144,7 @@ namespace ImageSimilarityPlugin
 
         /// <summary>
         /// 处理 Unity 原生 ObjectPicker 的选择事件。
-        /// 当用户在 Texture2D 选择器中选定资源后，解析为绝对路径。
+        /// 当用户在 Sprite 选择器中选定资源后，解析为绝对路径。
         /// </summary>
         private void HandleObjectPicker()
         {
@@ -733,10 +733,6 @@ namespace ImageSimilarityPlugin
         //  依赖安装
         // ==================================================================
 
-        /// <summary>
-        /// 启动 pip install 安装缺失的 Python 依赖。
-        /// stdout/stderr 实时输出到日志面板，进度条根据输出关键词推进。
-        /// </summary>
         /// <summary>
         /// 启动 pip install 安装缺失的 Python 依赖。
         /// 委托给 DependencyInstaller，通过 OnCompleted 回调接收结果。

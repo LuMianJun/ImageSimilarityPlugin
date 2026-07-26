@@ -228,7 +228,6 @@ def load_features_cache(cache_dir, folder_path):
         (image_paths, features_array) on success, or (None, None) on miss.
     """
     if cache_dir is None or not os.path.isdir(cache_dir):
-        sys.stderr.write(f"[cache] cache_dir missing or invalid: {cache_dir}\n")
         return None, None
 
     # Normalize cache_dir to fix mixed slashes from Unity's Application.temporaryCachePath
@@ -238,10 +237,7 @@ def load_features_cache(cache_dir, folder_path):
     npy_path = os.path.join(cache_dir, f"{h}.npy")
     json_path = os.path.join(cache_dir, f"{h}.json")
 
-    sys.stderr.write(f"[cache] folder={os.path.abspath(folder_path)}, hash={h}, looking for {npy_path}\n")
-
     if not os.path.isfile(json_path) or not os.path.isfile(npy_path):
-        sys.stderr.write("[cache] No cache files found — will extract features.\n")
         return None, None
 
     try:
@@ -250,28 +246,20 @@ def load_features_cache(cache_dir, folder_path):
 
         cached_paths = manifest.get("images", [])
         cached_count = manifest.get("count", 0)
-    except Exception as e:
-        sys.stderr.write(f"[cache] Failed to read manifest: {e}\n")
+    except Exception:
         return None, None
 
     if cached_count != len(cached_paths):
-        sys.stderr.write("[cache] Manifest inconsistent — will extract features.\n")
         return None, None
 
     try:
         features = np.load(npy_path)
-    except Exception as e:
-        sys.stderr.write(f"[cache] Failed to load .npy: {e}\n")
+    except Exception:
         return None, None
 
-    expected_shape = (cached_count, 1280)
-    if features.shape != expected_shape:
-        sys.stderr.write(
-            f"[cache] Shape mismatch: got {features.shape}, expected {expected_shape} — will extract features.\n"
-        )
+    if features.shape != (cached_count, 1280):
         return None, None
 
-    sys.stderr.write(f"[cache] Loaded cached features for {cached_count} images.\n")
     return cached_paths, features
 
 
@@ -348,7 +336,7 @@ def query_similar(query_image_path, folder_path, threshold=0.80, top_k=50,
     error_paths = []
 
     if cached_paths is not None and cached_features is not None:
-        # Use cached features. Build index mapping path -> feature.
+        # Use cached features.
         path_to_idx = {os.path.abspath(p): i for i, p in enumerate(cached_paths)}
         file_paths = []
         features = []
@@ -358,14 +346,8 @@ def query_similar(query_image_path, folder_path, threshold=0.80, top_k=50,
                 file_paths.append(tp)
                 features.append(cached_features[idx])
 
-        sys.stderr.write(
-            f"[cache] Hit: {len(file_paths)} of {len(target_paths)} target images found in cache.\n"
-        )
-
-        if progress_callback:
-            progress_callback(30)
-
         n_success = len(file_paths)
+        sys.stderr.write(f"[cache] Hit: {n_success}/{len(target_paths)} images loaded from cache.\n")
     else:
         # No cache — extract all features from scratch.
         sys.stderr.write("[cache] Miss — extracting features from scratch.\n")
