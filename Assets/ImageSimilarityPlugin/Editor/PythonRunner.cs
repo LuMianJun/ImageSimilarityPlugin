@@ -11,6 +11,8 @@ namespace ImageSimilarityPlugin
     /// Python 子进程管理器。
     /// 负责启动 headless CLI、异步读取 stdout/stderr、
     /// 解析 PROGRESS: 进度行，以及读取结果 JSON 文件。
+    /// 优先使用持久化 Python 会话（PythonSession），
+    /// 不可用时自动回退到独立子进程。
     /// </summary>
     public class PythonRunner
     {
@@ -25,6 +27,9 @@ namespace ImageSimilarityPlugin
 
         /// <summary>任务进度（0~1），从 Python stdout 的 PROGRESS: 行解析</summary>
         public float Progress => _progress;
+
+        /// <summary>进度更新时触发（主线程），订阅方应调用 Repaint()。</summary>
+        public event Action ProgressChanged;
 
         /// <summary>
         /// 获取插件捆绑的 Python 脚本所在目录的绝对路径。
@@ -87,9 +92,23 @@ namespace ImageSimilarityPlugin
             if (!string.IsNullOrEmpty(cacheFeaturesDir))
                 sb.Append(" --cache-features \"").Append(cacheFeaturesDir).Append("\"");
 
+            // Build session command for persistent server (fast path)
+            string sessionCmd = null;
+            if (!string.IsNullOrEmpty(cacheFeaturesDir))
+            {
+                sessionCmd = BuildSessionCommand("scan",
+                    new[] {
+                        ("folder", folderPath),
+                        ("threshold", threshold.ToString("F4")),
+                        ("workers", workers.ToString()),
+                        ("recursive", recursive ? "true" : "false"),
+                        ("cache_dir", cacheFeaturesDir),
+                    });
+            }
+
             RunAsync(sb.ToString(),
                 json => JsonUtility.FromJson<ScanResultData>(json),
-                onComplete, onError);
+                onComplete, onError, sessionCmd);
         }
 
         /// <summary>
@@ -130,9 +149,24 @@ namespace ImageSimilarityPlugin
             if (cacheDir != null)
                 sb.Append(" --cache \"").Append(cacheDir).Append("\"");
 
+            // Build session command for persistent server (fast path)
+            var cmdParams = new (string key, string value)[]
+            {
+                ("query", queryImagePath),
+                ("folder", folderPath),
+                ("threshold", threshold.ToString("F4")),
+                ("top_k", topK.ToString()),
+                ("workers", workers.ToString()),
+                ("recursive", recursive ? "true" : "false"),
+            };
+            string sessionCmd = BuildSessionCommand("query", cmdParams,
+                cacheDir != null
+                    ? new[] { ("cache_dir", cacheDir) }
+                    : null);
+
             RunAsync(sb.ToString(),
                 json => JsonUtility.FromJson<QueryResultData>(json),
-                onComplete, onError);
+                onComplete, onError, sessionCmd);
         }
 
         // ==================================================================
@@ -168,10 +202,62 @@ namespace ImageSimilarityPlugin
         }
 
         /// <summary>
-        /// 启动 Python 子进程的通用方法。
-        /// 处理进程生命周期、stderr 过滤、进度解析、JSON 反序列化。
+        /// 启动任务的通用方法。
+        /// 优先尝试持久化会话（省去 TF 加载时间），不可用时回退到子进程。
         /// </summary>
         private void RunAsync<T>(
+            string args,
+            Func<string, T> deserializer,
+            Action<T> onComplete,
+            Action<string> onError,
+            string sessionCmd = null)
+        {
+            // Try persistent session first (fast path)
+            if (!string.IsNullOrEmpty(sessionCmd) && PythonSession.Instance.IsReady)
+            {
+                _cancelled = false;
+                _progress = 0f;
+                _isRunning = true;
+
+                PythonSession.Instance.SendCommand(
+                    sessionCmd,
+                    onProgress: pct =>
+                    {
+                        _progress = pct;
+                        ProgressChanged?.Invoke();
+                    },
+                    onResult: resultJson =>
+                    {
+                        _isRunning = false;
+                        if (_cancelled) return;
+                        try
+                        {
+                            T result = deserializer(resultJson);
+                            if (result != null)
+                                onComplete?.Invoke(result);
+                            else
+                                onError?.Invoke("解析结果失败（持久会话）。");
+                        }
+                        catch (Exception ex)
+                        {
+                            onError?.Invoke($"解析结果出错: {ex.Message}");
+                        }
+                    },
+                    onError: err =>
+                    {
+                        UnityEngine.Debug.LogWarning($"[PythonRunner] Session unavailable ({err}), falling back to subprocess.");
+                        _isRunning = false;
+                        RunSubprocess(args, deserializer, onComplete, onError);
+                    }
+                );
+                return;
+            }
+
+            RunSubprocess(args, deserializer, onComplete, onError);
+        }
+
+        /// <summary>回退路径：启动独立 Python 子进程。</summary>
+        private void RunSubprocess<T>(
             string args,
             Func<string, T> deserializer,
             Action<T> onComplete,
@@ -294,6 +380,35 @@ namespace ImageSimilarityPlugin
                     File.Delete(_outputJsonPath);
             }
             catch { }
+        }
+
+        /// <summary>用 StringBuilder 拼出带 action 字段的 JSON 命令，保证格式正确。</summary>
+        private static string BuildSessionCommand(string action,
+            (string key, string value)[] required,
+            (string key, string value)[] optional = null)
+        {
+            var sb = new StringBuilder();
+            sb.Append("{\"action\":\"").Append(action).Append("\"");
+            foreach (var (k, v) in required)
+                AppendJsonField(sb, k, v);
+            if (optional != null)
+                foreach (var (k, v) in optional)
+                    AppendJsonField(sb, k, v);
+            sb.Append("}");
+            return sb.ToString();
+        }
+
+        private static void AppendJsonField(StringBuilder sb, string key, string value)
+        {
+            sb.Append(",\"").Append(key).Append("\":");
+            // Heuristic: if value looks like a number or bool literal, emit as-is;
+            // otherwise emit as a JSON string.
+            bool isLiteral = value == "true" || value == "false"
+                || (value.Length > 0 && (char.IsDigit(value[0]) || value[0] == '-'));
+            if (isLiteral)
+                sb.Append(value);
+            else
+                sb.Append("\"").Append(value.Replace("\\", "\\\\").Replace("\"", "\\\"")).Append("\"");
         }
     }
 }

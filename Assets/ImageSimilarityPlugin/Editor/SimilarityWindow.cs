@@ -75,6 +75,7 @@ namespace ImageSimilarityPlugin
         private void OnEnable()
         {
             _runner = new PythonRunner();
+            _runner.ProgressChanged += Repaint;
             _installer = new DependencyInstaller();
             _installer.OnCompleted += (success, msg) =>
             {
@@ -87,6 +88,10 @@ namespace ImageSimilarityPlugin
             // 默认扫描整个 Assets 目录
             if (string.IsNullOrEmpty(_folderPath))
                 _folderPath = Application.dataPath;
+
+            // 提前启动持久化 Python 会话，后台加载 TF 模型
+            if (PythonLocator.GetPythonPath() != null)
+                _ = PythonSession.Instance;
 
             CheckEnvironment();
         }
