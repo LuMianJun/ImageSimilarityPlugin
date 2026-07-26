@@ -1,6 +1,6 @@
 """
 Feature extractor engine for image similarity detection.
-Uses MobileNetV2 to extract 2048-dim feature vectors and cosine similarity for grouping.
+Uses MobileNetV2 to extract 1280-dim feature vectors and cosine similarity for grouping.
 
 Pure engine module — no GUI, no file I/O beyond reading images.
 Designed to be called from CLI or external tools like Unity.
@@ -9,6 +9,7 @@ Designed to be called from CLI or external tools like Unity.
 import hashlib
 import json
 import os
+import sys
 import time
 import numpy as np
 from PIL import Image
@@ -39,7 +40,7 @@ def get_model():
 
 def extract_features(img_path):
     """
-    Extract 2048-dim feature vector from a single image.
+    Extract 1280-dim feature vector from a single image.
     Returns None if the image cannot be read or processed.
     """
     try:
@@ -183,14 +184,14 @@ def save_features_cache(cache_dir, folder_path, image_paths, features):
     Save extracted features to disk cache.
 
     Writes two files:
-      {hash}.npy  — (N, 2048) float32 feature array
+      {hash}.npy  — (N, 1280) float32 feature array
       {hash}.json — manifest with image paths and metadata
 
     Args:
         cache_dir:   Directory to store cache files.
         folder_path: The scanned folder (used for hash key).
         image_paths: List of absolute image paths (order matches features).
-        features:    List of numpy feature vectors (each 2048-dim).
+        features:    List of numpy feature vectors (each 1280-dim).
     """
     os.makedirs(cache_dir, exist_ok=True)
     h = _folder_hash(folder_path)
@@ -214,25 +215,33 @@ def load_features_cache(cache_dir, folder_path):
     """
     Load cached features for a folder.
 
-    Freshness checks:
-      - Manifest .json must exist and match image count.
-      - No image file has mtime newer than the cache .npy file.
+    Only checks that cache files exist and can be parsed correctly.
+    Does NOT invalidate on image count change or mtime — missing/new images
+    are handled gracefully during lookup. To force a rebuild, delete the cache
+    or re-run a full scan.
 
     Args:
         cache_dir:   Directory containing cache files.
         folder_path: The folder to load cache for.
 
     Returns:
-        (image_paths, features_array) on success, or (None, None) on miss/stale.
+        (image_paths, features_array) on success, or (None, None) on miss.
     """
     if cache_dir is None or not os.path.isdir(cache_dir):
+        sys.stderr.write(f"[cache] cache_dir missing or invalid: {cache_dir}\n")
         return None, None
+
+    # Normalize cache_dir to fix mixed slashes from Unity's Application.temporaryCachePath
+    cache_dir = os.path.normpath(cache_dir)
 
     h = _folder_hash(folder_path)
     npy_path = os.path.join(cache_dir, f"{h}.npy")
     json_path = os.path.join(cache_dir, f"{h}.json")
 
+    sys.stderr.write(f"[cache] folder={os.path.abspath(folder_path)}, hash={h}, looking for {npy_path}\n")
+
     if not os.path.isfile(json_path) or not os.path.isfile(npy_path):
+        sys.stderr.write("[cache] No cache files found — will extract features.\n")
         return None, None
 
     try:
@@ -241,28 +250,29 @@ def load_features_cache(cache_dir, folder_path):
 
         cached_paths = manifest.get("images", [])
         cached_count = manifest.get("count", 0)
-    except Exception:
+    except Exception as e:
+        sys.stderr.write(f"[cache] Failed to read manifest: {e}\n")
         return None, None
 
     if cached_count != len(cached_paths):
+        sys.stderr.write("[cache] Manifest inconsistent — will extract features.\n")
         return None, None
-
-    # Check that all cached image files still exist and none is newer than cache
-    cache_mtime = os.path.getmtime(npy_path)
-    for p in cached_paths:
-        if not os.path.isfile(p):
-            return None, None
-        if os.path.getmtime(p) > cache_mtime:
-            return None, None
 
     try:
         features = np.load(npy_path)
-        expected_shape = (cached_count, 2048)
-        if features.shape != expected_shape:
-            return None, None
-        return cached_paths, features
-    except Exception:
+    except Exception as e:
+        sys.stderr.write(f"[cache] Failed to load .npy: {e}\n")
         return None, None
+
+    expected_shape = (cached_count, 1280)
+    if features.shape != expected_shape:
+        sys.stderr.write(
+            f"[cache] Shape mismatch: got {features.shape}, expected {expected_shape} — will extract features.\n"
+        )
+        return None, None
+
+    sys.stderr.write(f"[cache] Loaded cached features for {cached_count} images.\n")
+    return cached_paths, features
 
 
 # ==============================================================================
@@ -348,12 +358,17 @@ def query_similar(query_image_path, folder_path, threshold=0.80, top_k=50,
                 file_paths.append(tp)
                 features.append(cached_features[idx])
 
+        sys.stderr.write(
+            f"[cache] Hit: {len(file_paths)} of {len(target_paths)} target images found in cache.\n"
+        )
+
         if progress_callback:
             progress_callback(30)
 
         n_success = len(file_paths)
     else:
         # No cache — extract all features from scratch.
+        sys.stderr.write("[cache] Miss — extracting features from scratch.\n")
         features = []
         file_paths = []
         processed = 0
