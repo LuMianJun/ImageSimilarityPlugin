@@ -1,19 +1,24 @@
 """
-Headless CLI for image similarity detection.
+Headless CLI for query-by-image similarity search.
 Called by Unity Editor (or standalone) via subprocess.
 
 Usage:
-  python duplicate_detector_cli.py --folder "D:/path/to/images" --threshold 0.95 --output "result.json"
+  python image_query_cli.py --query "D:/path/to/query.png" --folder "D:/path/to/images"
+                            --threshold 0.80 --output "result.json"
 
 Stdout protocol (lines Unity parses):
   PROGRESS:<int>           # 0-100, real-time progress
 
 After completion, writes JSON to --output path:
   {
-    "total_images": 123,
-    "total_groups": 5,
-    "groups": [{"id": 1, "images": ["path/a.png", "path/b.png"]}, ...],
-    "elapsed_seconds": 12.5
+    "total_images": 500,
+    "query_image": "D:/path/to/query.png",
+    "threshold": 0.80,
+    "results": [
+      {"image_path": "D:/path/to/similar.png", "similarity": 0.987, "rank": 1},
+      ...
+    ],
+    "elapsed_seconds": 3.2
   }
 """
 
@@ -27,7 +32,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-from feature_extractor import find_duplicates
+from feature_extractor import query_similar
 
 
 def progress_printer(pct):
@@ -38,15 +43,23 @@ def progress_printer(pct):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Detect similar/duplicate images using MobileNetV2 + cosine similarity."
+        description="Query-by-image: find visually similar images using MobileNetV2 + cosine similarity."
+    )
+    parser.add_argument(
+        "--query", required=True,
+        help="Path to the query image."
     )
     parser.add_argument(
         "--folder", required=True,
-        help="Path to the folder containing images to scan."
+        help="Path to the folder containing target images to search."
     )
     parser.add_argument(
-        "--threshold", type=float, default=0.95,
-        help="Cosine similarity threshold (0-1). Higher = stricter. Default: 0.95"
+        "--threshold", type=float, default=0.80,
+        help="Cosine similarity threshold (0-1). Higher = stricter. Default: 0.80"
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=50,
+        help="Maximum number of results to return. Default: 50"
     )
     parser.add_argument(
         "--output", required=True,
@@ -61,13 +74,17 @@ def main():
         help="Number of parallel worker threads. Default: 4"
     )
     parser.add_argument(
-        "--cache-features", type=str, default=None,
+        "--cache", type=str, default=None,
         help="Directory for feature cache files (.npy + manifest). If omitted, no caching."
     )
 
     args = parser.parse_args()
 
     # Validate
+    if not os.path.isfile(args.query):
+        print(f"ERROR: Query image not found: {args.query}", file=sys.stderr)
+        sys.exit(1)
+
     if not os.path.isdir(args.folder):
         print(f"ERROR: Folder not found: {args.folder}", file=sys.stderr)
         sys.exit(1)
@@ -76,23 +93,26 @@ def main():
         print("ERROR: Threshold must be between 0 and 1", file=sys.stderr)
         sys.exit(1)
 
-    # Run detection
-    groups, total_images, elapsed, error_paths = find_duplicates(
+    # Run query
+    results_list, total_images, elapsed, error_paths = query_similar(
+        query_image_path=args.query,
         folder_path=args.folder,
         threshold=args.threshold,
+        top_k=args.top_k,
         workers=args.workers,
         recursive=args.recursive,
         progress_callback=progress_printer,
-        cache_dir=args.cache_features,
+        cache_dir=args.cache,
     )
 
-    # Build result
+    # Build result JSON — field names match C# QueryResultData / SimilarImage
     result = {
         "total_images": total_images,
-        "total_groups": len(groups),
-        "groups": [
-            {"id": idx + 1, "images": group}
-            for idx, group in enumerate(groups)
+        "query_image": os.path.abspath(args.query),
+        "threshold": args.threshold,
+        "results": [
+            {"image_path": item["path"], "similarity": item["similarity"], "rank": item["rank"]}
+            for item in results_list
         ],
         "elapsed_seconds": round(elapsed, 2),
     }
@@ -105,9 +125,9 @@ def main():
     with open(args.output, 'w', encoding='utf-8') as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
-    # Print a final summary line (informational, Unity can parse if needed)
+    # Print final summary line (informational)
     sys.stdout.write(
-        f"DONE: {total_images} images, {len(groups)} groups, {elapsed:.2f}s\n"
+        f"DONE: {total_images} images scanned, {len(results_list)} similar found, {elapsed:.2f}s\n"
     )
     sys.stdout.flush()
 

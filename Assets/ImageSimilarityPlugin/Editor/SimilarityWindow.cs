@@ -48,6 +48,17 @@ namespace ImageSimilarityPlugin
         // ===== 依赖安装 =====
         private DependencyInstaller _installer;
 
+        // ===== Tab 切换 =====
+        private int _tabIndex = 0;
+        private readonly string[] _tabNames = { "分组扫描", "以图搜图" };
+
+        // ===== 以图搜图参数 =====
+        private string _queryImagePath = "";      // 查询图片的绝对路径
+        private int _topK = 50;                   // 最大返回结果数
+
+        // ===== 查询结果 =====
+        private QueryResultData _queryResults;    // 查询结果
+
         // ==================================================================
         //  窗口生命周期
         // ==================================================================
@@ -116,6 +127,21 @@ namespace ImageSimilarityPlugin
         }
 
         // ==================================================================
+        //  Tab 标签栏
+        // ==================================================================
+
+        /// <summary>
+        /// 绘制顶部 Tab 标签栏，切换"分组扫描"和"以图搜图"。
+        /// </summary>
+        private void DrawTabBar()
+        {
+            EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
+            _tabIndex = GUILayout.Toolbar(_tabIndex, _tabNames, GUILayout.Height(28));
+            GUILayout.FlexibleSpace();
+            EditorGUILayout.EndHorizontal();
+        }
+
+        // ==================================================================
         //  主 GUI 布局
         // ==================================================================
 
@@ -125,11 +151,13 @@ namespace ImageSimilarityPlugin
             DrawEnvironmentBar();        // 顶部环境状态栏
             DrawInstallLog();            // 依赖安装日志（仅安装中可见）
             EditorGUILayout.Space(5);
-            DrawSettings();              // 扫描参数设置
+            DrawTabBar();                // Tab 标签栏
             EditorGUILayout.Space(5);
-            DrawScanControls();          // 扫描按钮 + 进度条 + 缓存提示
-            EditorGUILayout.Space(5);
-            DrawResults();               // 结果分组卡片
+
+            if (_tabIndex == 0)
+                DrawScanTab();
+            else
+                DrawQueryTab();
         }
 
         // ==================================================================
@@ -248,6 +276,22 @@ namespace ImageSimilarityPlugin
             }
 
             EditorGUILayout.EndVertical();
+        }
+
+        // ==================================================================
+        //  分组扫描 Tab
+        // ==================================================================
+
+        /// <summary>
+        /// 绘制"分组扫描"Tab 的全部内容。
+        /// </summary>
+        private void DrawScanTab()
+        {
+            DrawSettings();
+            EditorGUILayout.Space(5);
+            DrawScanControls();
+            EditorGUILayout.Space(5);
+            DrawResults();
         }
 
         // ==================================================================
@@ -539,6 +583,7 @@ namespace ImageSimilarityPlugin
                 threshold: _threshold,
                 recursive: _recursive,
                 workers: _workers,
+                cacheFeaturesDir: Path.Combine(CacheDir, "features"),
                 onComplete: result =>
                 {
                     _results = result;
@@ -790,6 +835,297 @@ namespace ImageSimilarityPlugin
             catch { }
             _hasCache = false;
             _cacheInfo = "";
+        }
+
+        // ==================================================================
+        //  以图搜图 Tab
+        // ==================================================================
+
+        /// <summary>
+        /// 绘制"以图搜图"Tab 的全部内容。
+        /// </summary>
+        private void DrawQueryTab()
+        {
+            DrawQuerySettings();
+            EditorGUILayout.Space(5);
+            DrawQueryControls();
+            EditorGUILayout.Space(5);
+            DrawQueryResults();
+        }
+
+        /// <summary>
+        /// 绘制查询参数区域：查询图片选择（文件浏览器 + 拖入区）、
+        /// 目标文件夹、相似度阈值、最大结果数。
+        /// </summary>
+        private void DrawQuerySettings()
+        {
+            EditorGUILayout.LabelField("查询设置", EditorStyles.boldLabel);
+
+            // 查询图片 — 文件选择器
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("查询图片:", GUILayout.Width(60));
+            _queryImagePath = EditorGUILayout.TextField(_queryImagePath);
+            if (GUILayout.Button("浏览", GUILayout.Width(70)))
+            {
+                string selected = EditorUtility.OpenFilePanel("选择查询图片", _folderPath,
+                    "png,jpg,jpeg,bmp,gif,tiff,tif,webp");
+                if (!string.IsNullOrEmpty(selected))
+                    _queryImagePath = selected;
+            }
+            EditorGUILayout.EndHorizontal();
+
+            // 查询图片 — 从 Project 窗口拖入
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("拖入资源:", GUILayout.Width(60));
+            Texture2D dragTex = (Texture2D)EditorGUILayout.ObjectField(null,
+                typeof(Texture2D), false, GUILayout.Height(40), GUILayout.Width(200));
+            if (dragTex != null)
+            {
+                string assetPath = AssetDatabase.GetAssetPath(dragTex);
+                _queryImagePath = Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath));
+            }
+            // 提示
+            EditorGUILayout.LabelField("从 Project 窗口拖入图片资源", EditorStyles.miniLabel);
+            EditorGUILayout.EndHorizontal();
+
+            // 目标文件夹
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("目标文件夹:", GUILayout.Width(80));
+            _folderPath = EditorGUILayout.TextField(_folderPath);
+            if (GUILayout.Button("浏览", GUILayout.Width(70)))
+            {
+                string selected = EditorUtility.OpenFolderPanel("选择目标文件夹", _folderPath, "");
+                if (!string.IsNullOrEmpty(selected))
+                    _folderPath = selected;
+            }
+            EditorGUILayout.EndHorizontal();
+
+            // 相似度阈值 + Top-K
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("相似度阈值:", GUILayout.Width(80));
+            _threshold = EditorGUILayout.Slider(_threshold, 0f, 1.00f);
+            EditorGUILayout.LabelField(_threshold.ToString("F3"), GUILayout.Width(40));
+            EditorGUILayout.EndHorizontal();
+
+            EditorGUILayout.BeginHorizontal();
+            EditorGUILayout.LabelField("最大结果数:", GUILayout.Width(80));
+            _topK = EditorGUILayout.IntSlider(_topK, 1, 200);
+            _recursive = EditorGUILayout.ToggleLeft("递归子目录", _recursive, GUILayout.Width(100));
+            EditorGUILayout.LabelField("线程数:", GUILayout.Width(60));
+            _workers = EditorGUILayout.IntSlider(_workers, 1, 16);
+            EditorGUILayout.EndHorizontal();
+        }
+
+        /// <summary>
+        /// 绘制查询按钮、取消按钮、进度条和状态消息。
+        /// </summary>
+        private void DrawQueryControls()
+        {
+            EditorGUILayout.BeginHorizontal();
+
+            bool canQuery = !string.IsNullOrEmpty(_pythonVersion) && _depsInstalled
+                && !_runner.IsRunning && File.Exists(_queryImagePath);
+
+            GUI.enabled = canQuery;
+            if (GUILayout.Button("开始搜索", GUILayout.Height(30), GUILayout.Width(120)))
+            {
+                StartQuery();
+            }
+            GUI.enabled = true;
+
+            if (_runner.IsRunning)
+            {
+                if (GUILayout.Button("取消", GUILayout.Height(30), GUILayout.Width(80)))
+                {
+                    _runner.Cancel();
+                    _statusMessage = "查询已取消。";
+                    _statusIsError = false;
+                    Repaint();
+                }
+            }
+
+            EditorGUILayout.EndHorizontal();
+
+            // 进度条
+            if (_runner.IsRunning)
+            {
+                Rect r = EditorGUILayout.GetControlRect(false, 20);
+                EditorGUI.ProgressBar(r, _runner.Progress, $"正在搜索... {(_runner.Progress * 100f):F0}%");
+            }
+
+            // 状态消息
+            if (!string.IsNullOrEmpty(_statusMessage))
+            {
+                GUI.color = _statusIsError ? Color.red : Color.white;
+                EditorGUILayout.LabelField(_statusMessage, EditorStyles.wordWrappedLabel);
+                GUI.color = Color.white;
+            }
+        }
+
+        /// <summary>
+        /// 启动以图搜图查询。
+        /// 验证查询图片和目标文件夹存在后，通过 PythonRunner 异步执行。
+        /// </summary>
+        private void StartQuery()
+        {
+            if (!File.Exists(_queryImagePath))
+            {
+                _statusMessage = $"查询图片不存在: {_queryImagePath}";
+                _statusIsError = true;
+                return;
+            }
+            if (!Directory.Exists(_folderPath))
+            {
+                _statusMessage = $"目标文件夹不存在: {_folderPath}";
+                _statusIsError = true;
+                return;
+            }
+
+            _results = null;
+            _queryResults = null;
+            ClearThumbnailCache();
+            _statusMessage = "";
+            _statusIsError = false;
+
+            _runner.StartQuery(
+                queryImagePath: _queryImagePath,
+                folderPath: _folderPath,
+                threshold: _threshold,
+                topK: _topK,
+                recursive: _recursive,
+                workers: _workers,
+                useCache: true,
+                onComplete: result =>
+                {
+                    _queryResults = result;
+                    float topScore = result.results.Count > 0 ? result.results[0].similarity : 0f;
+                    _statusMessage = $"搜索完成：在 {result.total_images} 张图片中找到 {result.results.Count} 张相似图片" +
+                                     (result.results.Count > 0 ? $" (最高相似度: {topScore:P1})" : "");
+                    _statusIsError = false;
+                    Repaint();
+                },
+                onError: error =>
+                {
+                    _statusMessage = error;
+                    _statusIsError = true;
+                    Repaint();
+                }
+            );
+        }
+
+        /// <summary>
+        /// 绘制查询结果区域。展示查询摘要和按相似度降序的结果列表。
+        /// </summary>
+        private void DrawQueryResults()
+        {
+            if (_queryResults == null || _queryResults.results == null || _queryResults.results.Count == 0)
+                return;
+
+            EditorGUILayout.LabelField("查询结果", EditorStyles.boldLabel);
+
+            // 摘要行
+            string summary = $"查询图片: {Path.GetFileName(_queryResults.query_image)}  |  " +
+                             $"在 {_queryResults.total_images} 张目标图片中命中 {_queryResults.results.Count} 张  |  " +
+                             $"耗时 {_queryResults.elapsed_seconds:F1} 秒  |  阈值: {_queryResults.threshold:F2}";
+            EditorGUILayout.LabelField(summary, EditorStyles.miniLabel);
+
+            EditorGUILayout.Space(5);
+
+            _scrollPos = EditorGUILayout.BeginScrollView(_scrollPos);
+
+            for (int i = 0; i < _queryResults.results.Count; i++)
+            {
+                DrawQueryResultRow(_queryResults.results[i]);
+                EditorGUILayout.Space(4);
+            }
+
+            EditorGUILayout.EndScrollView();
+        }
+
+        /// <summary>
+        /// 绘制单条查询结果行。
+        /// 横向卡片：排名号 → 缩略图 → 文件信息 → 相似度分数条 → 定位按钮。
+        /// </summary>
+        private void DrawQueryResultRow(SimilarImage img)
+        {
+            EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
+
+            // 排名标签
+            var rankStyle = new GUIStyle(EditorStyles.boldLabel)
+            {
+                alignment = TextAnchor.MiddleCenter,
+                fontSize = 14,
+            };
+            EditorGUILayout.LabelField($"#{img.rank}", rankStyle, GUILayout.Width(40));
+
+            // 缩略图
+            Texture2D thumb = GetThumbnail(img.image_path);
+            Rect thumbRect = GUILayoutUtility.GetRect(THUMB_SIZE, THUMB_SIZE,
+                GUILayout.Width(THUMB_SIZE), GUILayout.Height(THUMB_SIZE));
+            EditorGUI.DrawRect(thumbRect, new Color(0.2f, 0.2f, 0.2f, 0.5f));
+            if (thumb != null)
+            {
+                float texAspect = (float)thumb.width / Mathf.Max(1, thumb.height);
+                float drawW, drawH;
+                if (texAspect >= 1f) { drawW = THUMB_SIZE; drawH = THUMB_SIZE / texAspect; }
+                else { drawH = THUMB_SIZE; drawW = THUMB_SIZE * texAspect; }
+                Rect drawRect = new Rect(
+                    thumbRect.x + (THUMB_SIZE - drawW) / 2f,
+                    thumbRect.y + (THUMB_SIZE - drawH) / 2f,
+                    drawW, drawH);
+                GUI.DrawTexture(drawRect, thumb, ScaleMode.StretchToFill);
+            }
+            else
+            {
+                GUI.Label(thumbRect, "?", EditorStyles.centeredGreyMiniLabel);
+            }
+
+            // 点击缩略图定位
+            if (GUI.Button(thumbRect, GUIContent.none, GUIStyle.none))
+            {
+                PluginUtils.PingAsset(img.image_path);
+            }
+            FR2Integration.DrawRefCountBadge(thumbRect, img.image_path);
+
+            GUILayout.Space(8);
+
+            // 中间：文件信息
+            EditorGUILayout.BeginVertical();
+            EditorGUILayout.LabelField(Path.GetFileName(img.image_path), EditorStyles.boldLabel);
+            string assetPath = PluginUtils.AbsoluteToAssetPath(img.image_path);
+            if (!string.IsNullOrEmpty(assetPath))
+                EditorGUILayout.LabelField(assetPath, EditorStyles.miniLabel);
+            else
+                EditorGUILayout.LabelField(img.image_path, EditorStyles.miniLabel);
+            try
+            {
+                var fi = new FileInfo(img.image_path);
+                if (fi.Exists)
+                    EditorGUILayout.LabelField(PluginUtils.FormatFileSize(fi.Length), EditorStyles.miniLabel);
+            }
+            catch { }
+            EditorGUILayout.EndVertical();
+
+            GUILayout.FlexibleSpace();
+
+            // 右侧：相似度分数条
+            EditorGUILayout.BeginVertical(GUILayout.Width(160));
+            EditorGUILayout.LabelField($"相似度: {img.similarity:P2}", GUILayout.Width(120));
+
+            Rect barRect = GUILayoutUtility.GetRect(120, 16);
+            EditorGUI.DrawRect(new Rect(barRect.x, barRect.y, barRect.width, barRect.height),
+                new Color(0.3f, 0.3f, 0.3f));
+            Color barColor = img.similarity > 0.90f ? Color.green :
+                             img.similarity > 0.80f ? new Color(1f, 0.8f, 0f) : Color.red;
+            EditorGUI.DrawRect(new Rect(barRect.x, barRect.y, barRect.width * img.similarity, barRect.height),
+                barColor);
+
+            // 定位按钮
+            if (GUILayout.Button("定位", GUILayout.Width(50)))
+                PluginUtils.PingAsset(img.image_path);
+            EditorGUILayout.EndVertical();
+
+            EditorGUILayout.EndHorizontal();
         }
 
         /// <summary>
