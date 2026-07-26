@@ -36,7 +36,7 @@ def progress_callback(pct):
 # ===================================================================
 
 def handle_query(cmd):
-    results_list, total_images, elapsed, error_paths = query_similar(
+    results_list, total_images, elapsed, error_paths, cache_info = query_similar(
         query_image_path=cmd["query"],
         folder_path=cmd["folder"],
         threshold=cmd.get("threshold", 0.80),
@@ -46,7 +46,7 @@ def handle_query(cmd):
         progress_callback=progress_callback,
         cache_dir=cmd.get("cache_dir"),
     )
-    write_response({
+    result = {
         "type": "result",
         "total_images": total_images,
         "query_image": os.path.abspath(cmd["query"]),
@@ -56,11 +56,15 @@ def handle_query(cmd):
             for r in results_list
         ],
         "elapsed_seconds": round(elapsed, 2),
-    })
+    }
+    if cache_info is not None:
+        # Strip internal keys before sending to C#
+        result["cache_info"] = {k: v for k, v in cache_info.items() if not k.startswith("_")}
+    write_response(result)
 
 
 def handle_scan(cmd):
-    groups, total_images, elapsed, error_paths = find_duplicates(
+    groups, total_images, elapsed, error_paths, cache_info = find_duplicates(
         folder_path=cmd["folder"],
         threshold=cmd.get("threshold", 0.95),
         workers=cmd.get("workers", 4),
@@ -68,12 +72,64 @@ def handle_scan(cmd):
         progress_callback=progress_callback,
         cache_dir=cmd.get("cache_dir"),
     )
-    write_response({
+    result = {
         "type": "result",
         "total_images": total_images,
         "total_groups": len(groups),
         "groups": [{"id": i + 1, "images": g} for i, g in enumerate(groups)],
         "elapsed_seconds": round(elapsed, 2),
+    }
+    if cache_info is not None:
+        result["cache_info"] = {k: v for k, v in cache_info.items() if not k.startswith("_")}
+    write_response(result)
+
+
+def handle_check_cache(cmd):
+    """Lightweight check — only reads manifest + compares mtime, no TF inference."""
+    folder = cmd["folder"]
+    cache_dir = cmd.get("cache_dir")
+    recursive = cmd.get("recursive", True)
+
+    # Collect current image paths (same logic as query_similar / find_duplicates)
+    current_paths = []
+    if recursive:
+        for root, dirs, files in os.walk(folder):
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in SUPPORTED_EXTS:
+                    current_paths.append(os.path.join(root, f))
+    else:
+        try:
+            for f in os.listdir(folder):
+                full = os.path.join(folder, f)
+                if os.path.isfile(full) and os.path.splitext(f)[1].lower() in SUPPORTED_EXTS:
+                    current_paths.append(full)
+        except FileNotFoundError:
+            write_response({"type": "result", "cache_info": None, "total_current": 0})
+            return
+
+    total_current = len(current_paths)
+
+    # Load cache (single call; returns paths, features, cache_info)
+    cached_paths, _, cache_info = load_features_cache(cache_dir, folder)
+
+    if cache_info is None or cached_paths is None:
+        write_response({"type": "result", "cache_info": None,
+                        "total_current": total_current})
+        return
+
+    # Count new images (in folder but not in cache)
+    cached_abs = {os.path.abspath(p) for p in cached_paths}
+    new_count = sum(1 for p in current_paths if os.path.abspath(p) not in cached_abs)
+
+    cache_info["new_since_cache"] = new_count
+    cache_info["total_current"] = total_current
+
+    write_response({
+        "type": "result",
+        "cache_info": {k: v for k, v in cache_info.items() if not k.startswith("_")},
+        "total_current": total_current,
     })
 
 
@@ -114,6 +170,8 @@ def main():
                 handle_query(cmd)
             elif action == "scan":
                 handle_scan(cmd)
+            elif action == "check_cache":
+                handle_check_cache(cmd)
             else:
                 write_response({"type": "error", "message": f"Unknown action: {action}"})
         except Exception as e:

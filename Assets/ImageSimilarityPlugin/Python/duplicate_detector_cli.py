@@ -77,7 +77,7 @@ def main():
         sys.exit(1)
 
     # Run detection
-    groups, total_images, elapsed, error_paths = find_duplicates(
+    groups, total_images, elapsed, error_paths, _ = find_duplicates(
         folder_path=args.folder,
         threshold=args.threshold,
         workers=args.workers,

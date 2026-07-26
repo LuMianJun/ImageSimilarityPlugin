@@ -184,6 +184,50 @@ namespace ImageSimilarityPlugin
         // ==================================================================
 
         /// <summary>
+        /// 轻量检查缓存状态（不触发 TF 推理，毫秒级）。
+        /// 仅读取缓存 manifest 并对比文件系统 mtime。
+        /// </summary>
+        public void CheckCache(string folderPath, string cacheDir, bool recursive,
+            Action<CacheInfo> onResult, Action<string> onError)
+        {
+            var cmd = new System.Text.StringBuilder();
+            cmd.Append("{\"action\":\"check_cache\",\"folder\":\"");
+            cmd.Append(folderPath.Replace("\\", "\\\\").Replace("\"", "\\\""));
+            cmd.Append("\",\"recursive\":");
+            cmd.Append(recursive ? "true" : "false");
+            if (!string.IsNullOrEmpty(cacheDir))
+            {
+                cmd.Append(",\"cache_dir\":\"");
+                cmd.Append(cacheDir.Replace("\\", "\\\\").Replace("\"", "\\\""));
+                cmd.Append("\"");
+            }
+            cmd.Append("}");
+
+            SendCommand(cmd.ToString(),
+                onProgress: null,
+                onResult: json =>
+                {
+                    try
+                    {
+                        // Parse only cache_info from the result wrapper
+                        var wrapper = JsonUtility.FromJson<CheckCacheResult>(json);
+                        onResult?.Invoke(wrapper?.cache_info);
+                    }
+                    catch (Exception ex)
+                    {
+                        onError?.Invoke($"解析缓存状态失败: {ex.Message}");
+                    }
+                },
+                onError: onError);
+        }
+
+        [Serializable]
+        private class CheckCacheResult
+        {
+            public CacheInfo cache_info;
+        }
+
+        /// <summary>
         /// 向持久化 Python 进程发送命令。
         /// </summary>
         /// <param name="commandJson">符合 query_server.py 命令格式的 JSON 字符串</param>

@@ -74,11 +74,12 @@ def find_duplicates(folder_path, threshold=0.95, workers=4, recursive=False,
         cache_dir:    Optional directory for feature cache (.npy + manifest).
 
     Returns:
-        (groups, total_images, elapsed_seconds, error_paths)
+        (groups, total_images, elapsed_seconds, error_paths, cache_info)
           groups:       list of lists, each sublist is [path1, path2, ...] of similar images
           total_images: total number of images successfully processed
           elapsed_seconds: wall-clock time spent
           error_paths:  list of image paths that failed to process
+          cache_info:   dict with incremental update stats (None if no cache was used)
     """
     t_start = time.time()
 
@@ -101,35 +102,121 @@ def find_duplicates(folder_path, threshold=0.95, workers=4, recursive=False,
                     if ext in SUPPORTED_EXTS:
                         image_paths.append(full)
         except FileNotFoundError:
-            return [], 0, 0.0, []
+            return [], 0, 0.0, [], None
 
     total_found = len(image_paths)
     if total_found == 0:
-        return [], 0, time.time() - t_start, []
+        return [], 0, time.time() - t_start, [], None
 
-    # --- Extract features in parallel ---
+    # --- Load cache and identify what needs re-extraction ---
+    cached_paths, cached_features, stale_info = load_features_cache(cache_dir, folder_path)
     features = []
     file_paths = []
     error_paths = []
-    processed = 0
+    cache_info = None
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = [executor.submit(_process_one, (p, None)) for p in image_paths]
-        for future in as_completed(futures):
-            filepath, feat = future.result()
-            processed += 1
-            if feat is not None:
-                features.append(feat)
-                file_paths.append(filepath)
+    if cached_paths is not None and cached_features is not None:
+        # ── Cache hit: incremental update ──
+        cached_abs = {os.path.abspath(p): i for i, p in enumerate(cached_paths)}
+        mtimestamps = stale_info.get("_mtimestamps", {})
+
+        fresh_paths = []
+        fresh_features = []
+        stale_paths = []
+        new_paths = []
+
+        for tp in image_paths:
+            tp_abs = os.path.abspath(tp)
+            idx = cached_abs.get(tp_abs)
+            if idx is not None:
+                cached_mtime = mtimestamps.get(cached_paths[idx], 0.0)
+                try:
+                    actual_mtime = os.path.getmtime(tp)
+                except OSError:
+                    error_paths.append(tp)
+                    continue
+                if cached_mtime and abs(actual_mtime - cached_mtime) <= 1.0:
+                    fresh_paths.append(tp)
+                    fresh_features.append(cached_features[idx])
+                else:
+                    stale_paths.append(tp)
             else:
-                error_paths.append(filepath)
+                new_paths.append(tp)
 
-            if progress_callback:
-                # First 60% of progress is feature extraction
-                progress_callback(int(processed / total_found * 60))
+        re_extract_list = stale_paths + new_paths
+
+        if re_extract_list:
+            sys.stderr.write(
+                f"[cache] Scan incremental: re-extracting {len(stale_paths)} stale + "
+                f"{len(new_paths)} new = {len(re_extract_list)} images.\n"
+            )
+            processed = 0
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_process_one, (p, None)) for p in re_extract_list]
+                for future in as_completed(futures):
+                    filepath, feat = future.result()
+                    processed += 1
+                    if feat is not None:
+                        features.append(feat)
+                        file_paths.append(filepath)
+                    else:
+                        error_paths.append(filepath)
+
+                    if progress_callback:
+                        progress_callback(int(processed / len(re_extract_list) * 60))
+
+        # Merge fresh + re-extracted
+        file_paths = fresh_paths + file_paths
+        features = fresh_features + features
+
+        # Save updated cache
+        if cache_dir is not None and len(file_paths) > 0:
+            try:
+                save_features_cache(cache_dir, folder_path, file_paths, features)
+            except Exception:
+                pass
+
+        cache_info = {
+            "cache_hit": True,
+            "fresh_used": len(fresh_paths),
+            "re_extracted": len(stale_paths),
+            "new_added": len(new_paths),
+            "missing_removed": stale_info.get("missing_count", 0),
+            "total_cached": len(file_paths),
+        }
+        sys.stderr.write(
+            f"[cache] Scan updated: fresh={len(fresh_paths)} re_extracted={len(stale_paths)} "
+            f"new_added={len(new_paths)} missing_removed={cache_info['missing_removed']}\n"
+        )
+    else:
+        # ── No cache — extract all features from scratch ──
+        sys.stderr.write("[cache] Scan miss — extracting features from scratch.\n")
+        processed = 0
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_process_one, (p, None)) for p in image_paths]
+            for future in as_completed(futures):
+                filepath, feat = future.result()
+                processed += 1
+                if feat is not None:
+                    features.append(feat)
+                    file_paths.append(filepath)
+                else:
+                    error_paths.append(filepath)
+
+                if progress_callback:
+                    progress_callback(int(processed / total_found * 60))
+
+        # Save cache for future queries
+        if cache_dir is not None and len(file_paths) > 0:
+            try:
+                save_features_cache(cache_dir, folder_path, file_paths, features)
+            except Exception:
+                pass
 
     n_success = len(file_paths)
     if n_success < 2:
+        return [], n_success, time.time() - t_start, error_paths, cache_info
         return [], n_success, time.time() - t_start, error_paths
 
     # --- Save feature cache if requested ---
@@ -167,7 +254,7 @@ def find_duplicates(folder_path, threshold=0.95, workers=4, recursive=False,
         progress_callback(100)
 
     elapsed = time.time() - t_start
-    return groups, n_success, elapsed, error_paths
+    return groups, n_success, elapsed, error_paths, cache_info
 
 
 # ==============================================================================
@@ -185,7 +272,7 @@ def save_features_cache(cache_dir, folder_path, image_paths, features):
 
     Writes two files:
       {hash}.npy  — (N, 1280) float32 feature array
-      {hash}.json — manifest with image paths and metadata
+      {hash}.json — manifest with image paths, mtime, and metadata
 
     Args:
         cache_dir:   Directory to store cache files.
@@ -201,11 +288,20 @@ def save_features_cache(cache_dir, folder_path, image_paths, features):
     arr = np.array(features, dtype=np.float32)
     np.save(npy_path, arr)
 
+    # Record mtime for each file so we can detect changes later
+    mtimestamps = {}
+    for p in image_paths:
+        try:
+            mtimestamps[p] = os.path.getmtime(p)
+        except OSError:
+            mtimestamps[p] = 0.0
+
     manifest = {
         "images": image_paths,
         "count": len(image_paths),
         "folder": os.path.abspath(folder_path),
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "mtimestamps": mtimestamps,  # {path: mtime_float}
     }
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
@@ -215,20 +311,26 @@ def load_features_cache(cache_dir, folder_path):
     """
     Load cached features for a folder.
 
-    Only checks that cache files exist and can be parsed correctly.
-    Does NOT invalidate on image count change or mtime — missing/new images
-    are handled gracefully during lookup. To force a rebuild, delete the cache
-    or re-run a full scan.
+    Checks mtime of each cached file to detect changes.
+    Does NOT auto-invalidate — stale entries are reported so the caller
+    can decide whether to warn the user or rebuild.
 
     Args:
         cache_dir:   Directory containing cache files.
         folder_path: The folder to load cache for.
 
     Returns:
-        (image_paths, features_array) on success, or (None, None) on miss.
+        (image_paths, features_array, cache_info) on success.
+        (None, None, None) if cache doesn't exist or is broken.
+
+        cache_info dict keys:
+            stale_count   — files whose mtime changed since caching
+            missing_count — files in cache that no longer exist on disk
+            fresh_count   — files that are unchanged
+            total_cached  — total files in the cache
     """
     if cache_dir is None or not os.path.isdir(cache_dir):
-        return None, None
+        return None, None, None
 
     # Normalize cache_dir to fix mixed slashes from Unity's Application.temporaryCachePath
     cache_dir = os.path.normpath(cache_dir)
@@ -238,7 +340,7 @@ def load_features_cache(cache_dir, folder_path):
     json_path = os.path.join(cache_dir, f"{h}.json")
 
     if not os.path.isfile(json_path) or not os.path.isfile(npy_path):
-        return None, None
+        return None, None, None
 
     try:
         with open(json_path, 'r', encoding='utf-8') as f:
@@ -246,21 +348,52 @@ def load_features_cache(cache_dir, folder_path):
 
         cached_paths = manifest.get("images", [])
         cached_count = manifest.get("count", 0)
+        mtimestamps = manifest.get("mtimestamps", {})
     except Exception:
-        return None, None
+        return None, None, None
 
     if cached_count != len(cached_paths):
-        return None, None
+        return None, None, None
 
     try:
         features = np.load(npy_path)
     except Exception:
-        return None, None
+        return None, None, None
 
     if features.shape != (cached_count, 1280):
-        return None, None
+        return None, None, None
 
-    return cached_paths, features
+    # --- Check mtime for each cached file ---
+    stale_count = 0
+    missing_count = 0
+    fresh_count = 0
+    now = time.time()
+
+    for p in cached_paths:
+        cached_mtime = mtimestamps.get(p)
+        if cached_mtime is None:
+            # Legacy cache without mtime entry — treat as fresh but note
+            fresh_count += 1
+            continue
+        try:
+            actual_mtime = os.path.getmtime(p)
+            # Allow 1-second tolerance for filesystem timestamp granularity
+            if abs(actual_mtime - cached_mtime) > 1.0:
+                stale_count += 1
+            else:
+                fresh_count += 1
+        except OSError:
+            missing_count += 1
+
+    cache_info = {
+        "stale_count": stale_count,
+        "missing_count": missing_count,
+        "fresh_count": fresh_count,
+        "total_cached": cached_count,
+        "_mtimestamps": mtimestamps,  # internal: per-file mtime for incremental update
+    }
+
+    return cached_paths, features, cache_info
 
 
 # ==============================================================================
@@ -295,7 +428,7 @@ def query_similar(query_image_path, folder_path, threshold=0.80, top_k=50,
     # --- Extract query feature ---
     query_vec = extract_features(query_image_path)
     if query_vec is None:
-        return [], 0, time.time() - t_start, [query_image_path]
+        return [], 0, time.time() - t_start, [query_image_path], None
 
     if progress_callback:
         progress_callback(5)
@@ -322,34 +455,104 @@ def query_similar(query_image_path, folder_path, threshold=0.80, top_k=50,
                         if os.path.abspath(full) != query_abs:
                             target_paths.append(full)
         except FileNotFoundError:
-            return [], 0, time.time() - t_start, []
+            return [], 0, time.time() - t_start, [], None
 
     total_found = len(target_paths)
     if total_found == 0:
-        return [], 0, time.time() - t_start, []
+        return [], 0, time.time() - t_start, [], None
 
     if progress_callback:
         progress_callback(10)
 
     # --- Load or extract target features ---
-    cached_paths, cached_features = load_features_cache(cache_dir, folder_path)
+    cached_paths, cached_features, cache_info = load_features_cache(cache_dir, folder_path)
     error_paths = []
 
     if cached_paths is not None and cached_features is not None:
-        # Use cached features.
-        path_to_idx = {os.path.abspath(p): i for i, p in enumerate(cached_paths)}
-        file_paths = []
-        features = []
+        # ── Cache hit: identify fresh / stale / missing / new ──
+        cached_abs = {os.path.abspath(p): i for i, p in enumerate(cached_paths)}
+        mtimestamps = cache_info.get("_mtimestamps", {})
+
+        fresh_paths = []
+        fresh_features = []
+        stale_paths = []
+        new_paths = []
+
         for tp in target_paths:
-            idx = path_to_idx.get(os.path.abspath(tp))
+            tp_abs = os.path.abspath(tp)
+            idx = cached_abs.get(tp_abs)
             if idx is not None:
-                file_paths.append(tp)
-                features.append(cached_features[idx])
+                # Check mtime
+                cached_mtime = mtimestamps.get(cached_paths[idx], 0.0)
+                try:
+                    actual_mtime = os.path.getmtime(tp)
+                except OSError:
+                    # File disappeared since target scan — skip
+                    error_paths.append(tp)
+                    continue
+                if cached_mtime and abs(actual_mtime - cached_mtime) <= 1.0:
+                    fresh_paths.append(tp)
+                    fresh_features.append(cached_features[idx])
+                else:
+                    stale_paths.append(tp)
+            else:
+                new_paths.append(tp)
+
+        re_extract_list = stale_paths + new_paths
+        re_extracted_features = []
+        re_extracted_paths = []
+
+        if re_extract_list:
+            sys.stderr.write(
+                f"[cache] Incremental update: re-extracting {len(stale_paths)} stale + "
+                f"{len(new_paths)} new = {len(re_extract_list)} images.\n"
+            )
+            processed = 0
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_process_one, (p, None)) for p in re_extract_list]
+                for future in as_completed(futures):
+                    filepath, feat = future.result()
+                    processed += 1
+                    if feat is not None:
+                        re_extracted_features.append(feat)
+                        re_extracted_paths.append(filepath)
+                    else:
+                        error_paths.append(filepath)
+
+                    if progress_callback:
+                        # Extraction occupies 15%–65% of the bar
+                        progress_callback(15 + int(processed / len(re_extract_list) * 50))
+        else:
+            if progress_callback:
+                progress_callback(65)
+
+        # Merge: fresh (unchanged) + re-extracted (stale + new)
+        file_paths = fresh_paths + re_extracted_paths
+        features = fresh_features + re_extracted_features
+
+        # Save updated cache
+        if cache_dir is not None and len(file_paths) > 0:
+            try:
+                save_features_cache(cache_dir, folder_path, file_paths, features)
+            except Exception:
+                pass
 
         n_success = len(file_paths)
-        sys.stderr.write(f"[cache] Hit: {n_success}/{len(target_paths)} images loaded from cache.\n")
+        cache_info = {
+            "cache_hit": True,
+            "fresh_used": len(fresh_paths),
+            "re_extracted": len(stale_paths),
+            "new_added": len(new_paths),
+            "missing_removed": cache_info.get("missing_count", 0),
+            "total_cached": n_success,
+        }
+        sys.stderr.write(
+            f"[cache] Updated: fresh={len(fresh_paths)} re_extracted={len(stale_paths)} "
+            f"new_added={len(new_paths)} missing_removed={cache_info['missing_removed']}\n"
+        )
     else:
-        # No cache — extract all features from scratch.
+        # ── No cache — extract all features from scratch ──
+        cache_info = None
         sys.stderr.write("[cache] Miss — extracting features from scratch.\n")
         features = []
         file_paths = []
@@ -380,7 +583,7 @@ def query_similar(query_image_path, folder_path, threshold=0.80, top_k=50,
         n_success = len(file_paths)
 
     if n_success == 0:
-        return [], 0, time.time() - t_start, error_paths
+        return [], 0, time.time() - t_start, error_paths, cache_info
 
     if progress_callback:
         progress_callback(70)
@@ -409,4 +612,4 @@ def query_similar(query_image_path, folder_path, threshold=0.80, top_k=50,
     return [
         {"path": p, "similarity": s, "rank": idx + 1}
         for idx, (p, s) in enumerate(results)
-    ], n_success, elapsed, error_paths
+    ], n_success, elapsed, error_paths, cache_info

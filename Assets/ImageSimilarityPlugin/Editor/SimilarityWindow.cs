@@ -35,8 +35,11 @@ namespace ImageSimilarityPlugin
         private static string CacheDir => Path.Combine(Application.temporaryCachePath, "ImageSimilarityPlugin");
         private string _cachePath;         // 当前文件夹对应的缓存文件路径
         private string _lastCheckedFolder; // 上一次检查缓存的文件夹，用于检测变化
+        private string _lastFeatureCheckFolder; // 上一次检查特征缓存过期的文件夹
+        private bool _pendingFeatureCheck;  // 等待 session ready 后重试
         private bool _hasCache;            // 是否有有效缓存可用
         private string _cacheInfo;         // 缓存摘要信息（用于 UI 显示）
+        private CacheInfo _featureCacheStaleness; // 特征缓存过期检测结果（null=未检查/无缓存）
 
         // ===== 结果 UI =====
         private Vector2 _scrollPos;
@@ -183,6 +186,7 @@ namespace ImageSimilarityPlugin
         private void OnGUI()
         {
             CheckCache();               // 检测文件夹是否改变，刷新缓存状态
+            RetryPendingFeatureCheck(); // session 就绪后补发缓存过期检查
             DrawEnvironmentBar();        // 顶部环境状态栏
             DrawInstallLog();            // 依赖安装日志（仅安装中可见）
             EditorGUILayout.Space(5);
@@ -403,6 +407,9 @@ namespace ImageSimilarityPlugin
 
             EditorGUILayout.EndHorizontal();
 
+            // 特征缓存过期警告
+            DrawFeatureCacheWarning();
+
             // 扫描进度条
             if (_runner.IsRunning)
             {
@@ -467,6 +474,9 @@ namespace ImageSimilarityPlugin
             EditorGUILayout.LabelField(
                 $"在 {_results.total_images} 张图片中找到 {_results.total_groups} 组相似图片 " +
                 $"(耗时 {_results.elapsed_seconds:F1} 秒)。");
+
+            // 缓存更新信息
+            DrawCacheInfo(_results.cache_info);
 
             EditorGUILayout.Space(5);
 
@@ -615,6 +625,7 @@ namespace ImageSimilarityPlugin
             ClearThumbnailCache();
             _statusMessage = "";
             _statusIsError = false;
+            _featureCacheStaleness = null; // 扫描期间隐藏过期警告
 
             _runner.StartScan(
                 folderPath: _folderPath,
@@ -628,6 +639,7 @@ namespace ImageSimilarityPlugin
                     _statusMessage = $"扫描完成：找到 {result.total_groups} 组相似图片。";
                     _statusIsError = false;
                     SaveCache(result);
+                    _featureCacheStaleness = null; // 扫描后缓存已最新，清除警告
                     Repaint();
                 },
                 onError: error =>
@@ -765,7 +777,7 @@ namespace ImageSimilarityPlugin
         // ==================================================================
 
         /// <summary>
-        /// 检测当前文件夹是否有对应的扫描缓存。
+        /// 检测当前文件夹是否有对应的扫描缓存 + 特征缓存是否过期。
         /// 每种文件夹对应一个独立的缓存文件（文件名基于路径哈希）。
         /// 如果文件夹未变则跳过检测。
         /// </summary>
@@ -774,6 +786,7 @@ namespace ImageSimilarityPlugin
             if (_folderPath == _lastCheckedFolder) return;
             _lastCheckedFolder = _folderPath;
 
+            // --- 扫描结果缓存 ---
             _cachePath = GetCacheFilePath();
             if (File.Exists(_cachePath))
             {
@@ -785,13 +798,56 @@ namespace ImageSimilarityPlugin
                     {
                         _hasCache = true;
                         _cacheInfo = $"{meta.total_groups} 组 | 阈值: {meta.threshold:F2} | {meta.date}";
-                        return;
                     }
                 }
-                catch { }
+                catch { _hasCache = false; _cacheInfo = ""; }
             }
-            _hasCache = false;
-            _cacheInfo = "";
+            else { _hasCache = false; _cacheInfo = ""; }
+
+            // --- 特征缓存过期检测（异步，通过持久化 Python 会话） ---
+            _featureCacheStaleness = null;
+            _pendingFeatureCheck = false;
+            TriggerFeatureCacheCheck();
+        }
+
+        /// <summary>
+        /// 通过持久化 Python 会话异步检查特征缓存是否过期。
+        /// 结果存入 _featureCacheStaleness。
+        /// </summary>
+        private void RetryPendingFeatureCheck()
+        {
+            if (!_pendingFeatureCheck) return;
+            if (!PythonSession.Instance.IsReady) return;
+            // Session is now ready — retry the check
+            _lastFeatureCheckFolder = null; // allow Trigger to proceed
+            TriggerFeatureCacheCheck();
+        }
+
+        private void TriggerFeatureCacheCheck()
+        {
+            if (string.IsNullOrEmpty(_folderPath)) return;
+            if (_folderPath == _lastFeatureCheckFolder) return;
+            _lastFeatureCheckFolder = _folderPath;
+
+            if (!PythonSession.Instance.IsReady)
+            {
+                _pendingFeatureCheck = true;
+                return;
+            }
+
+            _pendingFeatureCheck = false;
+            string featuresDir = Path.Combine(CacheDir, "features");
+            PythonSession.Instance.CheckCache(
+                _folderPath, featuresDir, _recursive,
+                onResult: info =>
+                {
+                    _featureCacheStaleness = info;
+                    Repaint();
+                },
+                onError: err =>
+                {
+                    UnityEngine.Debug.LogWarning($"[SimilarityWindow] Feature cache check failed: {err}");
+                });
         }
 
         /// <summary>
@@ -978,6 +1034,9 @@ namespace ImageSimilarityPlugin
 
             EditorGUILayout.EndHorizontal();
 
+            // 特征缓存过期警告
+            DrawFeatureCacheWarning();
+
             // 进度条
             if (_runner.IsRunning)
             {
@@ -1018,6 +1077,7 @@ namespace ImageSimilarityPlugin
             ClearThumbnailCache();
             _statusMessage = "";
             _statusIsError = false;
+            _featureCacheStaleness = null; // 查询期间隐藏过期警告
 
             _runner.StartQuery(
                 queryImagePath: _queryImagePath,
@@ -1030,6 +1090,7 @@ namespace ImageSimilarityPlugin
                 onComplete: result =>
                 {
                     _queryResults = result;
+                    _featureCacheStaleness = null; // 查询后缓存已更新，清除警告
                     float topScore = result.results.Count > 0 ? result.results[0].similarity : 0f;
                     _statusMessage = $"搜索完成：在 {result.total_images} 张图片中找到 {result.results.Count} 张相似图片" +
                                      (result.results.Count > 0 ? $" (最高相似度: {topScore:P1})" : "");
@@ -1043,6 +1104,71 @@ namespace ImageSimilarityPlugin
                     Repaint();
                 }
             );
+        }
+
+        /// <summary>
+        /// 绘制特征缓存过期警告条（扫描前预检结果）。
+        /// 当有图片修改/新增/删除时显示黄色警告 + "重新扫描"按钮。
+        /// </summary>
+        private void DrawFeatureCacheWarning()
+        {
+            if (_featureCacheStaleness == null) return;
+            if (!_featureCacheStaleness.HasChanges) return;
+
+            EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
+            GUI.color = new Color(1f, 0.85f, 0.3f);
+            var sb = new System.Text.StringBuilder();
+            sb.Append("⚠️ 特征缓存可能过期：");
+            if (_featureCacheStaleness.fresh_count > 0)
+                sb.Append($"{_featureCacheStaleness.fresh_count} 张未变  ");
+            if (_featureCacheStaleness.stale_count > 0)
+                sb.Append($"{_featureCacheStaleness.stale_count} 张已修改  ");
+            if (_featureCacheStaleness.new_since_cache > 0)
+                sb.Append($"{_featureCacheStaleness.new_since_cache} 张新增  ");
+            if (_featureCacheStaleness.missing_count > 0)
+                sb.Append($"{_featureCacheStaleness.missing_count} 张已删除  ");
+            EditorGUILayout.LabelField(sb.ToString(), EditorStyles.miniLabel);
+            GUI.color = Color.white;
+
+            bool canScan = !string.IsNullOrEmpty(_pythonVersion) && _depsInstalled && !_runner.IsRunning;
+            GUI.enabled = canScan;
+            if (GUILayout.Button("重新扫描", GUILayout.Width(100), GUILayout.Height(22)))
+            {
+                if (_tabIndex == 0)
+                    StartScan();
+                else
+                    StartQuery();
+            }
+            GUI.enabled = true;
+            EditorGUILayout.EndHorizontal();
+        }
+
+        /// <summary>
+        /// 绘制缓存更新信息条。仅当有增量更新发生（重新提取或新增）时显示。
+        /// </summary>
+        private void DrawCacheInfo(CacheInfo info)
+        {
+            if (info == null) return;
+
+            bool hasChanges = info.re_extracted > 0 || info.new_added > 0
+                           || info.missing_removed > 0;
+            if (!hasChanges) return;
+
+            EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
+            GUI.color = new Color(1f, 0.85f, 0.3f); // yellow tint
+            var sb = new System.Text.StringBuilder();
+            sb.Append("📦 缓存已增量更新：");
+            if (info.fresh_used > 0)
+                sb.Append($"{info.fresh_used} 张复用缓存  ");
+            if (info.re_extracted > 0)
+                sb.Append($"{info.re_extracted} 张已修改  ");
+            if (info.new_added > 0)
+                sb.Append($"{info.new_added} 张新增  ");
+            if (info.missing_removed > 0)
+                sb.Append($"{info.missing_removed} 张已删除  ");
+            EditorGUILayout.LabelField(sb.ToString(), EditorStyles.miniLabel);
+            GUI.color = Color.white;
+            EditorGUILayout.EndHorizontal();
         }
 
         /// <summary>
@@ -1060,6 +1186,9 @@ namespace ImageSimilarityPlugin
                              $"在 {_queryResults.total_images} 张目标图片中命中 {_queryResults.results.Count} 张  |  " +
                              $"耗时 {_queryResults.elapsed_seconds:F1} 秒  |  阈值: {_queryResults.threshold:F2}";
             EditorGUILayout.LabelField(summary, EditorStyles.miniLabel);
+
+            // 缓存更新信息
+            DrawCacheInfo(_queryResults.cache_info);
 
             EditorGUILayout.Space(5);
 

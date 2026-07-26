@@ -21,6 +21,9 @@ namespace ImageSimilarityPlugin
 
         /// <summary>扫描耗时（秒）</summary>
         public double elapsed_seconds;
+
+        /// <summary>特征缓存更新信息（持久会话命中时有值）</summary>
+        public CacheInfo cache_info;
     }
 
     /// <summary>
@@ -37,7 +40,7 @@ namespace ImageSimilarityPlugin
     }
 
     /// <summary>
-    /// 以图搜图查询结果，对应 image_query_cli.py 输出的 JSON。
+    /// 以图搜图查询结果，对应 image_query_cli.py / query_server.py 输出的 JSON。
     /// 由 JsonUtility.FromJson 反序列化填充。
     /// </summary>
     [Serializable]
@@ -57,6 +60,61 @@ namespace ImageSimilarityPlugin
 
         /// <summary>查询耗时（秒）</summary>
         public double elapsed_seconds;
+
+        /// <summary>特征缓存更新信息（持久会话命中时有值，子进程回退时可能为 null）</summary>
+        public CacheInfo cache_info;
+    }
+
+    /// <summary>
+    /// 特征缓存状态信息，由 query_server.py 返回。
+    ///
+    /// 用于两种场景：
+    /// 1. scan/query 完成后 — 报告本次增量更新了多少张
+    /// 2. check_cache 预先检查 — 报告缓存中有多少张过期/新增/删除
+    /// </summary>
+    [Serializable]
+    public class CacheInfo
+    {
+        // ---- 增量更新后字段 (scan/query result) ----
+        /// <summary>缓存是否命中</summary>
+        public bool cache_hit;
+
+        /// <summary>直接复用缓存的图片数（mtime 未变）</summary>
+        public int fresh_used;
+
+        /// <summary>mtime 变化，本次重新提取的数量</summary>
+        public int re_extracted;
+
+        /// <summary>缓存中不存在，本次新增提取的数量</summary>
+        public int new_added;
+
+        /// <summary>文件已删除，从缓存移除的数量</summary>
+        public int missing_removed;
+
+        // ---- 预检字段 (check_cache result) ----
+        /// <summary>mtime 变化、尚未更新的数量（check_cache 时）</summary>
+        public int stale_count;
+
+        /// <summary>缓存中有但文件已不存在的数量（check_cache 时）</summary>
+        public int missing_count;
+
+        /// <summary>mtime 未变的图片数（check_cache 时）</summary>
+        public int fresh_count;
+
+        /// <summary>文件夹中有但缓存中没有的数量（check_cache 时）</summary>
+        public int new_since_cache;
+
+        /// <summary>当前文件夹中的图片总数</summary>
+        public int total_current;
+
+        // ---- 通用 ----
+        /// <summary>缓存中的图片总数</summary>
+        public int total_cached;
+
+        /// <summary>缓存是否有需要关注的变化（过期/新增/删除任一项>0）</summary>
+        public bool HasChanges =>
+            stale_count > 0 || new_since_cache > 0 || missing_count > 0 ||
+            re_extracted > 0 || new_added > 0 || missing_removed > 0;
     }
 
     /// <summary>

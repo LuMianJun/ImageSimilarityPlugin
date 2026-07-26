@@ -94,7 +94,7 @@ def main():
         sys.exit(1)
 
     # Run query
-    results_list, total_images, elapsed, error_paths = query_similar(
+    results_list, total_images, elapsed, error_paths, _ = query_similar(
         query_image_path=args.query,
         folder_path=args.folder,
         threshold=args.threshold,
