@@ -15,6 +15,7 @@ namespace ImageSimilarityPlugin
     {
         private Process _installProcess;
         private bool _isInstalling;
+        private bool _isPanelVisible;
         private float _installProgress;
         private string _installLog = "";
         private Vector2 _installLogScrollPos;
@@ -22,6 +23,9 @@ namespace ImageSimilarityPlugin
 
         /// <summary>是否有安装正在进行中</summary>
         public bool IsInstalling => _isInstalling;
+
+        /// <summary>安装日志面板是否可见；安装结束后保留，直到用户关闭。</summary>
+        public bool IsPanelVisible => _isPanelVisible;
 
         /// <summary>安装进度（0~1）</summary>
         public float Progress => _installProgress;
@@ -48,7 +52,8 @@ namespace ImageSimilarityPlugin
             if (string.IsNullOrEmpty(pythonPath))
             {
                 _installLog = "错误: 未找到 Python，无法安装依赖。\n请先在顶部点击配置 Python 指定路径。";
-                _isInstalling = true;
+                _isPanelVisible = true;
+                _isInstalling = false;
                 _installProgress = 0f;
                 return;
             }
@@ -57,12 +62,14 @@ namespace ImageSimilarityPlugin
             if (!File.Exists(_reqPath))
             {
                 _installLog = $"错误: 未找到 requirements.txt\n路径: {_reqPath}";
-                _isInstalling = true;
+                _isPanelVisible = true;
+                _isInstalling = false;
                 _installProgress = 0f;
                 return;
             }
 
             // 重置状态
+            _isPanelVisible = true;
             _isInstalling = true;
             _installProgress = 0f;
             _installLog = "";
@@ -80,10 +87,11 @@ namespace ImageSimilarityPlugin
                     CreateNoWindow = true,
                 };
 
-                _installProcess = new Process { StartInfo = psi, EnableRaisingEvents = true };
+                var process = new Process { StartInfo = psi, EnableRaisingEvents = true };
+                _installProcess = process;
 
                 // stdout → 实时日志 + 进度推进
-                _installProcess.OutputDataReceived += (sender, e) =>
+                process.OutputDataReceived += (sender, e) =>
                 {
                     if (e.Data == null) return;
                     EditorApplication.delayCall += () =>
@@ -99,7 +107,7 @@ namespace ImageSimilarityPlugin
                 };
 
                 // stderr → 也追加到日志
-                _installProcess.ErrorDataReceived += (sender, e) =>
+                process.ErrorDataReceived += (sender, e) =>
                 {
                     if (e.Data == null) return;
                     EditorApplication.delayCall += () =>
@@ -110,28 +118,38 @@ namespace ImageSimilarityPlugin
                 };
 
                 // 进程退出处理
-                _installProcess.Exited += (sender, e) =>
+                process.Exited += (sender, e) =>
                 {
                     EditorApplication.delayCall += () =>
                     {
+                        if (!ReferenceEquals(_installProcess, process))
+                        {
+                            try { process.Dispose(); } catch { }
+                            return;
+                        }
+
                         _installProgress = 1f;
-                        bool success = _installProcess.ExitCode == 0;
+                        _isInstalling = false;
+                        bool success = process.ExitCode == 0;
                         string msg = success ? "依赖包安装成功。" :
                             $"依赖包安装失败，请手动运行:\npip install -r \"{_reqPath}\"";
-                        _installProcess.Dispose();
+                        process.Dispose();
                         _installProcess = null;
                         OnCompleted?.Invoke(success, msg);
                     };
                 };
 
-                _installProcess.Start();
-                _installProcess.BeginOutputReadLine();
-                _installProcess.BeginErrorReadLine();
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
             }
             catch (Exception ex)
             {
-                _installLog += $"\n错误: {ex.Message}";
+                _installLog = $"错误: {ex.Message}";
+                _isInstalling = false;
                 _installProgress = 0f;
+                try { _installProcess?.Dispose(); } catch { }
+                _installProcess = null;
                 OnCompleted?.Invoke(false, $"运行 pip 失败: {ex.Message}");
             }
         }
@@ -142,6 +160,7 @@ namespace ImageSimilarityPlugin
         /// </summary>
         public void Close()
         {
+            _isPanelVisible = false;
             _isInstalling = false;
             _installLog = "";
             try
@@ -150,6 +169,8 @@ namespace ImageSimilarityPlugin
                     _installProcess.Kill();
             }
             catch { }
+            try { _installProcess?.Dispose(); } catch { }
+            _installProcess = null;
         }
     }
 }

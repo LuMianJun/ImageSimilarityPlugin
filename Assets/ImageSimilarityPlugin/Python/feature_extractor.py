@@ -1,615 +1,468 @@
-"""
-Feature extractor engine for image similarity detection.
-Uses MobileNetV2 to extract 1280-dim feature vectors and cosine similarity for grouping.
+"""Image feature extraction, duplicate grouping, and query-by-image search."""
 
-Pure engine module — no GUI, no file I/O beyond reading images.
-Designed to be called from CLI or external tools like Unity.
-"""
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import json
 import os
 import sys
 import time
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
 import numpy as np
 from PIL import Image
 import tensorflow as tf
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
 from tensorflow.keras.preprocessing import image
-from sklearn.metrics.pairwise import cosine_similarity
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Suppress TensorFlow log noise
-tf.get_logger().setLevel('ERROR')
 
-# Supported image extensions
-SUPPORTED_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.tif', '.webp'}
+tf.get_logger().setLevel("ERROR")
 
-# Lazy-loaded model
+SUPPORTED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tiff", ".tif", ".webp"}
+FEATURE_DIMENSION = 1280
+MTIME_TOLERANCE_SECONDS = 1.0
+
 _model = None
 
 
 def get_model():
-    """Lazy-load MobileNetV2 (downloads weights on first call)."""
+    """Lazy-load MobileNetV2. Keras downloads ImageNet weights on first use."""
     global _model
     if _model is None:
-        _model = MobileNetV2(weights='imagenet', include_top=False, pooling='avg')
+        _model = MobileNetV2(weights="imagenet", include_top=False, pooling="avg")
     return _model
 
 
 def extract_features(img_path):
-    """
-    Extract 1280-dim feature vector from a single image.
-    Returns None if the image cannot be read or processed.
-    """
+    """Return one 1280-dimensional feature vector, or None on failure."""
     try:
         model = get_model()
-        img = Image.open(img_path).convert('RGB').resize((224, 224))
-        img_array = image.img_to_array(img)
+        with Image.open(img_path) as source:
+            resized = source.convert("RGB").resize((224, 224))
+        img_array = image.img_to_array(resized)
         img_array = preprocess_input(np.expand_dims(img_array, axis=0))
-        features = model.predict(img_array, verbose=0).flatten()
-        return features
+        return model.predict(img_array, verbose=0).flatten()
     except Exception:
         return None
 
 
-def _process_one(args):
-    """Worker function for ThreadPoolExecutor."""
-    filepath, _ = args
-    return filepath, extract_features(filepath)
+def collect_image_paths(folder_path, recursive=False, excluded_directories=None):
+    """Collect supported images while pruning configured directory subtrees."""
+    if not os.path.isdir(folder_path):
+        return []
 
+    excluded_keys = _normalize_excluded_directories(excluded_directories)
+    if _is_path_excluded(folder_path, excluded_keys):
+        return []
 
-def find_duplicates(folder_path, threshold=0.95, workers=4, recursive=False,
-                    progress_callback=None, cache_dir=None):
-    """
-    Scan a folder for images and group similar ones.
-
-    Args:
-        folder_path:  Path to the folder containing images.
-        threshold:    Cosine similarity threshold (0-1). Higher = stricter.
-        workers:      Number of parallel threads for feature extraction.
-        recursive:    If True, walk subdirectories recursively.
-        progress_callback:  Optional callable(int) called with 0-100 progress.
-        cache_dir:    Optional directory for feature cache (.npy + manifest).
-
-    Returns:
-        (groups, total_images, elapsed_seconds, error_paths, cache_info)
-          groups:       list of lists, each sublist is [path1, path2, ...] of similar images
-          total_images: total number of images successfully processed
-          elapsed_seconds: wall-clock time spent
-          error_paths:  list of image paths that failed to process
-          cache_info:   dict with incremental update stats (None if no cache was used)
-    """
-    t_start = time.time()
-
-    # --- Collect image paths ---
     image_paths = []
     if recursive:
         for root, dirs, files in os.walk(folder_path):
-            # Skip hidden directories
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            for f in files:
-                ext = os.path.splitext(f)[1].lower()
-                if ext in SUPPORTED_EXTS:
-                    image_paths.append(os.path.join(root, f))
-    else:
-        try:
-            for f in os.listdir(folder_path):
-                full = os.path.join(folder_path, f)
-                if os.path.isfile(full):
-                    ext = os.path.splitext(f)[1].lower()
-                    if ext in SUPPORTED_EXTS:
-                        image_paths.append(full)
-        except FileNotFoundError:
-            return [], 0, 0.0, [], None
-
-    total_found = len(image_paths)
-    if total_found == 0:
-        return [], 0, time.time() - t_start, [], None
-
-    # --- Load cache and identify what needs re-extraction ---
-    cached_paths, cached_features, stale_info = load_features_cache(cache_dir, folder_path)
-    features = []
-    file_paths = []
-    error_paths = []
-    cache_info = None
-
-    if cached_paths is not None and cached_features is not None:
-        # ── Cache hit: incremental update ──
-        cached_abs = {os.path.abspath(p): i for i, p in enumerate(cached_paths)}
-        mtimestamps = stale_info.get("_mtimestamps", {})
-
-        fresh_paths = []
-        fresh_features = []
-        stale_paths = []
-        new_paths = []
-
-        for tp in image_paths:
-            tp_abs = os.path.abspath(tp)
-            idx = cached_abs.get(tp_abs)
-            if idx is not None:
-                cached_mtime = mtimestamps.get(cached_paths[idx], 0.0)
-                try:
-                    actual_mtime = os.path.getmtime(tp)
-                except OSError:
-                    error_paths.append(tp)
-                    continue
-                if cached_mtime and abs(actual_mtime - cached_mtime) <= 1.0:
-                    fresh_paths.append(tp)
-                    fresh_features.append(cached_features[idx])
-                else:
-                    stale_paths.append(tp)
-            else:
-                new_paths.append(tp)
-
-        re_extract_list = stale_paths + new_paths
-
-        if re_extract_list:
-            sys.stderr.write(
-                f"[cache] Scan incremental: re-extracting {len(stale_paths)} stale + "
-                f"{len(new_paths)} new = {len(re_extract_list)} images.\n"
+            # 自顶向下剪枝，排除目录下的文件不会进入枚举，也不会产生无效缓存项。
+            dirs[:] = sorted(
+                directory for directory in dirs
+                if not directory.startswith(".")
+                and not _is_path_excluded(os.path.join(root, directory), excluded_keys)
             )
-            processed = 0
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = [executor.submit(_process_one, (p, None)) for p in re_extract_list]
-                for future in as_completed(futures):
-                    filepath, feat = future.result()
-                    processed += 1
-                    if feat is not None:
-                        features.append(feat)
-                        file_paths.append(filepath)
-                    else:
-                        error_paths.append(filepath)
-
-                    if progress_callback:
-                        progress_callback(int(processed / len(re_extract_list) * 60))
-
-        # Merge fresh + re-extracted
-        file_paths = fresh_paths + file_paths
-        features = fresh_features + features
-
-        # Save updated cache
-        if cache_dir is not None and len(file_paths) > 0:
-            try:
-                save_features_cache(cache_dir, folder_path, file_paths, features)
-            except Exception:
-                pass
-
-        cache_info = {
-            "cache_hit": True,
-            "fresh_used": len(fresh_paths),
-            "re_extracted": len(stale_paths),
-            "new_added": len(new_paths),
-            "missing_removed": stale_info.get("missing_count", 0),
-            "total_cached": len(file_paths),
-        }
-        sys.stderr.write(
-            f"[cache] Scan updated: fresh={len(fresh_paths)} re_extracted={len(stale_paths)} "
-            f"new_added={len(new_paths)} missing_removed={cache_info['missing_removed']}\n"
-        )
+            for file_name in files:
+                if os.path.splitext(file_name)[1].lower() in SUPPORTED_EXTS:
+                    image_paths.append(os.path.join(root, file_name))
     else:
-        # ── No cache — extract all features from scratch ──
-        sys.stderr.write("[cache] Scan miss — extracting features from scratch.\n")
-        processed = 0
+        for file_name in os.listdir(folder_path):
+            full_path = os.path.join(folder_path, file_name)
+            if os.path.isfile(full_path) and os.path.splitext(file_name)[1].lower() in SUPPORTED_EXTS:
+                image_paths.append(full_path)
 
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(_process_one, (p, None)) for p in image_paths]
-            for future in as_completed(futures):
-                filepath, feat = future.result()
-                processed += 1
-                if feat is not None:
-                    features.append(feat)
-                    file_paths.append(filepath)
-                else:
-                    error_paths.append(filepath)
+    return sorted(image_paths, key=_path_key)
 
-                if progress_callback:
-                    progress_callback(int(processed / total_found * 60))
 
-        # Save cache for future queries
-        if cache_dir is not None and len(file_paths) > 0:
-            try:
-                save_features_cache(cache_dir, folder_path, file_paths, features)
-            except Exception:
-                pass
+def _normalize_excluded_directories(excluded_directories):
+    if not excluded_directories:
+        return []
+    return sorted({
+        os.path.normcase(os.path.realpath(path))
+        for path in excluded_directories
+        if path
+    })
 
-    n_success = len(file_paths)
-    if n_success < 2:
-        return [], n_success, time.time() - t_start, error_paths, cache_info
-        return [], n_success, time.time() - t_start, error_paths
 
-    # --- Save feature cache if requested ---
-    if cache_dir is not None:
+def _is_path_excluded(path, excluded_keys):
+    path_key = os.path.normcase(os.path.realpath(path))
+    for excluded_key in excluded_keys:
         try:
-            save_features_cache(cache_dir, folder_path, file_paths, features)
-        except Exception:
-            pass  # cache save failure should not abort the scan
-
-    # --- Compute similarity matrix ---
-    if progress_callback:
-        progress_callback(65)
-
-    similarity = cosine_similarity(features)
-
-    if progress_callback:
-        progress_callback(80)
-
-    # --- Group duplicates ---
-    visited = set()
-    groups = []
-
-    for i in range(n_success):
-        if i in visited:
+            if os.path.commonpath((path_key, excluded_key)) == excluded_key:
+                return True
+        except ValueError:
+            # Windows 不同盘符没有公共路径，视为无关目录。
             continue
-        group = [file_paths[i]]
-        for j in range(i + 1, n_success):
-            if j not in visited and similarity[i][j] > threshold:
-                group.append(file_paths[j])
-                visited.add(j)
-        if len(group) > 1:
-            groups.append(group)
-
-    if progress_callback:
-        progress_callback(100)
-
-    elapsed = time.time() - t_start
-    return groups, n_success, elapsed, error_paths, cache_info
+    return False
 
 
-# ==============================================================================
-#  特征缓存读写
-# ==============================================================================
-
-def _folder_hash(folder_path):
-    """Generate a stable 8-char hex hash for a folder path."""
-    return hashlib.md5(os.path.abspath(folder_path).encode('utf-8')).hexdigest()[:8]
+def _path_key(path):
+    return os.path.normcase(os.path.abspath(path))
 
 
-def save_features_cache(cache_dir, folder_path, image_paths, features):
-    """
-    Save extracted features to disk cache.
+def _process_one(img_path):
+    return img_path, extract_features(img_path)
 
-    Writes two files:
-      {hash}.npy  — (N, 1280) float32 feature array
-      {hash}.json — manifest with image paths, mtime, and metadata
 
-    Args:
-        cache_dir:   Directory to store cache files.
-        folder_path: The scanned folder (used for hash key).
-        image_paths: List of absolute image paths (order matches features).
-        features:    List of numpy feature vectors (each 1280-dim).
-    """
+def _extract_paths(image_paths, workers, progress_callback=None, progress_start=0, progress_span=100):
+    """Extract a path list and preserve its deterministic input order."""
+    if not image_paths:
+        if progress_callback:
+            progress_callback(progress_start + progress_span)
+        return [], [], []
+
+    # CLI 首次运行时先在主线程加载一次模型，避免多个 worker 同时创建模型和下载权重。
+    get_model()
+    workers = max(1, int(workers))
+    feature_by_path = {}
+    error_paths = []
+    processed = 0
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(_process_one, path) for path in image_paths]
+        for future in as_completed(futures):
+            file_path, feature = future.result()
+            processed += 1
+            if feature is None:
+                error_paths.append(file_path)
+            else:
+                feature_by_path[_path_key(file_path)] = feature
+
+            if progress_callback:
+                progress = progress_start + int(processed / len(image_paths) * progress_span)
+                progress_callback(progress)
+
+    successful_paths = [path for path in image_paths if _path_key(path) in feature_by_path]
+    features = [feature_by_path[_path_key(path)] for path in successful_paths]
+    return successful_paths, features, error_paths
+
+
+def _folder_hash(folder_path, recursive=False, excluded_directories=None):
+    """Generate a stable key for one folder and scan scope."""
+    normalized = os.path.normcase(os.path.realpath(folder_path))
+    scope = "recursive" if recursive else "top-level"
+    exclusions = json.dumps(
+        _normalize_excluded_directories(excluded_directories),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(
+        f"{normalized}|{scope}|{exclusions}".encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _cache_paths(cache_dir, folder_path, recursive, excluded_directories=None):
+    cache_key = _folder_hash(folder_path, recursive, excluded_directories)
+    return (
+        os.path.join(cache_dir, f"{cache_key}.npy"),
+        os.path.join(cache_dir, f"{cache_key}.json"),
+    )
+
+
+def save_features_cache(cache_dir, folder_path, image_paths, features, recursive=False,
+                        excluded_directories=None):
+    """Atomically save feature vectors and their path/mtime manifest."""
     os.makedirs(cache_dir, exist_ok=True)
-    h = _folder_hash(folder_path)
-    npy_path = os.path.join(cache_dir, f"{h}.npy")
-    json_path = os.path.join(cache_dir, f"{h}.json")
+    npy_path, json_path = _cache_paths(
+        cache_dir, folder_path, recursive, excluded_directories)
 
-    arr = np.array(features, dtype=np.float32)
-    np.save(npy_path, arr)
-
-    # Record mtime for each file so we can detect changes later
     mtimestamps = {}
-    for p in image_paths:
+    for path in image_paths:
         try:
-            mtimestamps[p] = os.path.getmtime(p)
+            mtimestamps[path] = os.path.getmtime(path)
         except OSError:
-            mtimestamps[p] = 0.0
+            mtimestamps[path] = 0.0
 
     manifest = {
         "images": image_paths,
         "count": len(image_paths),
         "folder": os.path.abspath(folder_path),
+        "recursive": recursive,
+        "excluded_directories": _normalize_excluded_directories(excluded_directories),
         "date": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "mtimestamps": mtimestamps,  # {path: mtime_float}
+        "mtimestamps": mtimestamps,
     }
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+
+    npy_temp = npy_path + ".tmp"
+    json_temp = json_path + ".tmp"
+    try:
+        with open(npy_temp, "wb") as npy_file:
+            np.save(npy_file, np.asarray(features, dtype=np.float32))
+        with open(json_temp, "w", encoding="utf-8") as json_file:
+            json.dump(manifest, json_file, ensure_ascii=False, indent=2)
+        os.replace(npy_temp, npy_path)
+        os.replace(json_temp, json_path)
+    finally:
+        for temp_path in (npy_temp, json_temp):
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
 
 
-def load_features_cache(cache_dir, folder_path):
-    """
-    Load cached features for a folder.
-
-    Checks mtime of each cached file to detect changes.
-    Does NOT auto-invalidate — stale entries are reported so the caller
-    can decide whether to warn the user or rebuild.
-
-    Args:
-        cache_dir:   Directory containing cache files.
-        folder_path: The folder to load cache for.
-
-    Returns:
-        (image_paths, features_array, cache_info) on success.
-        (None, None, None) if cache doesn't exist or is broken.
-
-        cache_info dict keys:
-            stale_count   — files whose mtime changed since caching
-            missing_count — files in cache that no longer exist on disk
-            fresh_count   — files that are unchanged
-            total_cached  — total files in the cache
-    """
+def load_features_cache(cache_dir, folder_path, recursive=False, excluded_directories=None):
+    """Load a feature cache and report stale, missing, and fresh entries."""
     if cache_dir is None or not os.path.isdir(cache_dir):
         return None, None, None
 
-    # Normalize cache_dir to fix mixed slashes from Unity's Application.temporaryCachePath
     cache_dir = os.path.normpath(cache_dir)
-
-    h = _folder_hash(folder_path)
-    npy_path = os.path.join(cache_dir, f"{h}.npy")
-    json_path = os.path.join(cache_dir, f"{h}.json")
-
+    npy_path, json_path = _cache_paths(
+        cache_dir, folder_path, recursive, excluded_directories)
     if not os.path.isfile(json_path) or not os.path.isfile(npy_path):
         return None, None, None
 
     try:
-        with open(json_path, 'r', encoding='utf-8') as f:
-            manifest = json.load(f)
-
+        with open(json_path, "r", encoding="utf-8") as manifest_file:
+            manifest = json.load(manifest_file)
         cached_paths = manifest.get("images", [])
         cached_count = manifest.get("count", 0)
         mtimestamps = manifest.get("mtimestamps", {})
-    except Exception:
+        features = np.load(npy_path, allow_pickle=False)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
         return None, None, None
 
-    if cached_count != len(cached_paths):
+    if cached_count != len(cached_paths) or features.shape != (cached_count, FEATURE_DIMENSION):
         return None, None, None
 
-    try:
-        features = np.load(npy_path)
-    except Exception:
-        return None, None, None
-
-    if features.shape != (cached_count, 1280):
-        return None, None, None
-
-    # --- Check mtime for each cached file ---
     stale_count = 0
     missing_count = 0
     fresh_count = 0
-    now = time.time()
-
-    for p in cached_paths:
-        cached_mtime = mtimestamps.get(p)
-        if cached_mtime is None:
-            # Legacy cache without mtime entry — treat as fresh but note
-            fresh_count += 1
-            continue
+    for path in cached_paths:
+        cached_mtime = mtimestamps.get(path)
         try:
-            actual_mtime = os.path.getmtime(p)
-            # Allow 1-second tolerance for filesystem timestamp granularity
-            if abs(actual_mtime - cached_mtime) > 1.0:
-                stale_count += 1
-            else:
-                fresh_count += 1
+            actual_mtime = os.path.getmtime(path)
         except OSError:
             missing_count += 1
+            continue
+
+        # 旧缓存没有 mtime 时只做一次全量更新，不能把未知状态永久当作新鲜数据。
+        if cached_mtime is None or abs(actual_mtime - cached_mtime) > MTIME_TOLERANCE_SECONDS:
+            stale_count += 1
+        else:
+            fresh_count += 1
 
     cache_info = {
         "stale_count": stale_count,
         "missing_count": missing_count,
         "fresh_count": fresh_count,
         "total_cached": cached_count,
-        "_mtimestamps": mtimestamps,  # internal: per-file mtime for incremental update
+        "_mtimestamps": mtimestamps,
     }
-
     return cached_paths, features, cache_info
 
 
-# ==============================================================================
-#  以图搜图 (Query-by-Image)
-# ==============================================================================
+def _save_cache_safely(cache_dir, folder_path, file_paths, features, recursive,
+                       excluded_directories):
+    if cache_dir is None or not file_paths:
+        return
+    try:
+        save_features_cache(
+            cache_dir, folder_path, file_paths, features, recursive,
+            excluded_directories)
+    except Exception as error:
+        sys.stderr.write(f"[cache] Failed to save feature cache: {error}\n")
+        sys.stderr.flush()
+
+
+def _load_or_extract_features(
+        folder_path,
+        image_paths,
+        workers,
+        recursive,
+        cache_dir,
+        excluded_directories,
+        progress_callback,
+        progress_start,
+        progress_span):
+    """Resolve a complete feature set by reusing fresh cache entries."""
+    cached_paths, cached_features, stale_info = load_features_cache(
+        cache_dir, folder_path, recursive, excluded_directories)
+
+    if cached_paths is None or cached_features is None:
+        sys.stderr.write("[cache] Miss - extracting features from scratch.\n")
+        file_paths, features, error_paths = _extract_paths(
+            image_paths, workers, progress_callback, progress_start, progress_span)
+        _save_cache_safely(
+            cache_dir, folder_path, file_paths, features, recursive,
+            excluded_directories)
+        return file_paths, features, error_paths, None
+
+    cached_index = {_path_key(path): index for index, path in enumerate(cached_paths)}
+    mtimestamps = stale_info.get("_mtimestamps", {})
+    feature_by_path = {}
+    stale_paths = []
+    new_paths = []
+    error_paths = []
+
+    for path in image_paths:
+        index = cached_index.get(_path_key(path))
+        if index is None:
+            new_paths.append(path)
+            continue
+
+        cached_mtime = mtimestamps.get(cached_paths[index])
+        try:
+            actual_mtime = os.path.getmtime(path)
+        except OSError:
+            error_paths.append(path)
+            continue
+
+        if cached_mtime is not None and abs(actual_mtime - cached_mtime) <= MTIME_TOLERANCE_SECONDS:
+            feature_by_path[_path_key(path)] = cached_features[index]
+        else:
+            stale_paths.append(path)
+
+    re_extract_paths = stale_paths + new_paths
+    if re_extract_paths:
+        sys.stderr.write(
+            f"[cache] Incremental update: {len(stale_paths)} stale, "
+            f"{len(new_paths)} new.\n")
+    extracted_paths, extracted_features, extraction_errors = _extract_paths(
+        re_extract_paths, workers, progress_callback, progress_start, progress_span)
+    error_paths.extend(extraction_errors)
+    for path, feature in zip(extracted_paths, extracted_features):
+        feature_by_path[_path_key(path)] = feature
+
+    # 按本次扫描顺序重新组装，避免线程完成顺序让分组和排名在多次运行间漂移。
+    file_paths = [path for path in image_paths if _path_key(path) in feature_by_path]
+    features = [feature_by_path[_path_key(path)] for path in file_paths]
+    _save_cache_safely(
+        cache_dir, folder_path, file_paths, features, recursive,
+        excluded_directories)
+
+    cache_info = {
+        "cache_hit": True,
+        "fresh_used": len(file_paths) - len(extracted_paths),
+        "re_extracted": len(stale_paths),
+        "new_added": len(new_paths),
+        "missing_removed": stale_info.get("missing_count", 0),
+        "total_cached": len(file_paths),
+    }
+    return file_paths, features, error_paths, cache_info
+
+
+def _cosine_similarity_matrix(features):
+    matrix = np.asarray(features, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+    normalized = np.divide(matrix, norms, out=np.zeros_like(matrix), where=norms != 0)
+    return normalized @ normalized.T
+
+
+def _cosine_similarity_to_query(query_feature, target_features):
+    query = np.asarray(query_feature, dtype=np.float32)
+    targets = np.asarray(target_features, dtype=np.float32)
+    query_norm = np.linalg.norm(query)
+    target_norms = np.linalg.norm(targets, axis=1)
+    denominators = target_norms * query_norm
+    return np.divide(
+        targets @ query,
+        denominators,
+        out=np.zeros(len(targets), dtype=np.float32),
+        where=denominators != 0,
+    )
+
+
+def find_duplicates(folder_path, threshold=0.95, workers=4, recursive=False,
+                    progress_callback=None, cache_dir=None,
+                    excluded_directories=None):
+    """Scan a folder and return anchor-based groups above the threshold."""
+    started_at = time.time()
+    image_paths = collect_image_paths(folder_path, recursive, excluded_directories)
+    if not image_paths:
+        return [], 0, time.time() - started_at, [], None
+
+    file_paths, features, error_paths, cache_info = _load_or_extract_features(
+        folder_path, image_paths, workers, recursive, cache_dir,
+        excluded_directories,
+        progress_callback, 0, 60)
+    image_count = len(file_paths)
+    if image_count < 2:
+        return [], image_count, time.time() - started_at, error_paths, cache_info
+
+    if progress_callback:
+        progress_callback(65)
+    similarity = _cosine_similarity_matrix(features)
+    if progress_callback:
+        progress_callback(80)
+
+    visited = set()
+    groups = []
+    for anchor in range(image_count):
+        if anchor in visited:
+            continue
+        visited.add(anchor)
+        group = [file_paths[anchor]]
+        for candidate in range(anchor + 1, image_count):
+            if candidate not in visited and similarity[anchor][candidate] >= threshold:
+                group.append(file_paths[candidate])
+                visited.add(candidate)
+        if len(group) > 1:
+            groups.append(group)
+
+    if progress_callback:
+        progress_callback(100)
+    return groups, image_count, time.time() - started_at, error_paths, cache_info
+
 
 def query_similar(query_image_path, folder_path, threshold=0.80, top_k=50,
-                   workers=4, recursive=False, progress_callback=None,
-                   cache_dir=None):
-    """
-    Given a query image, find all visually similar images in a target folder.
-
-    Args:
-        query_image_path: Absolute path to the query image.
-        folder_path:      Path to the folder containing target images.
-        threshold:        Minimum cosine similarity (0-1) to include.
-        top_k:            Maximum number of results to return.
-        workers:          Number of parallel threads for feature extraction.
-        recursive:        If True, walk subdirectories recursively.
-        progress_callback: Optional callable(int) called with 0-100 progress.
-        cache_dir:        Optional directory for feature cache (.npy + manifest).
-
-    Returns:
-        (results, total_images, elapsed_seconds, error_paths)
-          results:       list of {path, similarity, rank} dicts, sorted desc.
-          total_images:  number of target images successfully processed.
-          elapsed_seconds: wall-clock time spent.
-          error_paths:   list of image paths that failed to process.
-    """
-    t_start = time.time()
-
-    # --- Extract query feature ---
-    query_vec = extract_features(query_image_path)
-    if query_vec is None:
-        return [], 0, time.time() - t_start, [query_image_path], None
+                  workers=4, recursive=False, progress_callback=None,
+                  cache_dir=None, excluded_directories=None):
+    """Find target images whose cosine similarity meets the threshold."""
+    started_at = time.time()
+    query_feature = extract_features(query_image_path)
+    if query_feature is None:
+        return [], 0, time.time() - started_at, [query_image_path], None
 
     if progress_callback:
         progress_callback(5)
 
-    # --- Collect target image paths (exclude the query image itself) ---
-    query_abs = os.path.abspath(query_image_path)
-    target_paths = []
-    if recursive:
-        for root, dirs, files in os.walk(folder_path):
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            for f in files:
-                ext = os.path.splitext(f)[1].lower()
-                if ext in SUPPORTED_EXTS:
-                    full = os.path.join(root, f)
-                    if os.path.abspath(full) != query_abs:
-                        target_paths.append(full)
-    else:
-        try:
-            for f in os.listdir(folder_path):
-                full = os.path.join(folder_path, f)
-                if os.path.isfile(full):
-                    ext = os.path.splitext(f)[1].lower()
-                    if ext in SUPPORTED_EXTS:
-                        if os.path.abspath(full) != query_abs:
-                            target_paths.append(full)
-        except FileNotFoundError:
-            return [], 0, time.time() - t_start, [], None
-
-    total_found = len(target_paths)
-    if total_found == 0:
-        return [], 0, time.time() - t_start, [], None
+    all_image_paths = collect_image_paths(
+        folder_path, recursive, excluded_directories)
+    query_key = _path_key(query_image_path)
+    if not any(_path_key(path) != query_key for path in all_image_paths):
+        return [], 0, time.time() - started_at, [], None
 
     if progress_callback:
         progress_callback(10)
 
-    # --- Load or extract target features ---
-    cached_paths, cached_features, cache_info = load_features_cache(cache_dir, folder_path)
-    error_paths = []
+    # 缓存始终覆盖完整扫描范围；查询图只在计算结果时排除，避免轮换查询导致缓存反复缺项。
+    file_paths, features, error_paths, cache_info = _load_or_extract_features(
+        folder_path, all_image_paths, workers, recursive, cache_dir,
+        excluded_directories,
+        progress_callback, 10, 50)
 
-    if cached_paths is not None and cached_features is not None:
-        # ── Cache hit: identify fresh / stale / missing / new ──
-        cached_abs = {os.path.abspath(p): i for i, p in enumerate(cached_paths)}
-        mtimestamps = cache_info.get("_mtimestamps", {})
+    targets = [
+        (path, feature)
+        for path, feature in zip(file_paths, features)
+        if _path_key(path) != query_key
+    ]
+    if not targets:
+        return [], 0, time.time() - started_at, error_paths, cache_info
 
-        fresh_paths = []
-        fresh_features = []
-        stale_paths = []
-        new_paths = []
-
-        for tp in target_paths:
-            tp_abs = os.path.abspath(tp)
-            idx = cached_abs.get(tp_abs)
-            if idx is not None:
-                # Check mtime
-                cached_mtime = mtimestamps.get(cached_paths[idx], 0.0)
-                try:
-                    actual_mtime = os.path.getmtime(tp)
-                except OSError:
-                    # File disappeared since target scan — skip
-                    error_paths.append(tp)
-                    continue
-                if cached_mtime and abs(actual_mtime - cached_mtime) <= 1.0:
-                    fresh_paths.append(tp)
-                    fresh_features.append(cached_features[idx])
-                else:
-                    stale_paths.append(tp)
-            else:
-                new_paths.append(tp)
-
-        re_extract_list = stale_paths + new_paths
-        re_extracted_features = []
-        re_extracted_paths = []
-
-        if re_extract_list:
-            sys.stderr.write(
-                f"[cache] Incremental update: re-extracting {len(stale_paths)} stale + "
-                f"{len(new_paths)} new = {len(re_extract_list)} images.\n"
-            )
-            processed = 0
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = [executor.submit(_process_one, (p, None)) for p in re_extract_list]
-                for future in as_completed(futures):
-                    filepath, feat = future.result()
-                    processed += 1
-                    if feat is not None:
-                        re_extracted_features.append(feat)
-                        re_extracted_paths.append(filepath)
-                    else:
-                        error_paths.append(filepath)
-
-                    if progress_callback:
-                        # Extraction occupies 15%–65% of the bar
-                        progress_callback(15 + int(processed / len(re_extract_list) * 50))
-        else:
-            if progress_callback:
-                progress_callback(65)
-
-        # Merge: fresh (unchanged) + re-extracted (stale + new)
-        file_paths = fresh_paths + re_extracted_paths
-        features = fresh_features + re_extracted_features
-
-        # Save updated cache
-        if cache_dir is not None and len(file_paths) > 0:
-            try:
-                save_features_cache(cache_dir, folder_path, file_paths, features)
-            except Exception:
-                pass
-
-        n_success = len(file_paths)
-        cache_info = {
-            "cache_hit": True,
-            "fresh_used": len(fresh_paths),
-            "re_extracted": len(stale_paths),
-            "new_added": len(new_paths),
-            "missing_removed": cache_info.get("missing_count", 0),
-            "total_cached": n_success,
-        }
-        sys.stderr.write(
-            f"[cache] Updated: fresh={len(fresh_paths)} re_extracted={len(stale_paths)} "
-            f"new_added={len(new_paths)} missing_removed={cache_info['missing_removed']}\n"
-        )
-    else:
-        # ── No cache — extract all features from scratch ──
-        cache_info = None
-        sys.stderr.write("[cache] Miss — extracting features from scratch.\n")
-        features = []
-        file_paths = []
-        processed = 0
-
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(_process_one, (p, None)) for p in target_paths]
-            for future in as_completed(futures):
-                filepath, feat = future.result()
-                processed += 1
-                if feat is not None:
-                    features.append(feat)
-                    file_paths.append(filepath)
-                else:
-                    error_paths.append(filepath)
-
-                if progress_callback:
-                    # 10%–60% range for extraction
-                    progress_callback(10 + int(processed / total_found * 50))
-
-        # Save cache for future queries
-        if cache_dir is not None and len(file_paths) > 0:
-            try:
-                save_features_cache(cache_dir, folder_path, file_paths, features)
-            except Exception:
-                pass
-
-        n_success = len(file_paths)
-
-    if n_success == 0:
-        return [], 0, time.time() - t_start, error_paths, cache_info
-
+    target_paths = [path for path, _ in targets]
+    target_features = [feature for _, feature in targets]
     if progress_callback:
         progress_callback(70)
-
-    # --- Compute 1xN cosine similarity ---
-    target_matrix = np.array(features, dtype=np.float32)
-    similarities = cosine_similarity([query_vec], target_matrix)[0]
-
+    similarities = _cosine_similarity_to_query(query_feature, target_features)
     if progress_callback:
         progress_callback(85)
 
-    # --- Filter, sort, truncate ---
-    results = []
-    for i in range(n_success):
-        score = float(similarities[i])
-        if score > threshold:
-            results.append((file_paths[i], score))
-
-    results.sort(key=lambda x: x[1], reverse=True)
-    results = results[:top_k]
+    matches = [
+        (path, float(score))
+        for path, score in zip(target_paths, similarities)
+        if score >= threshold
+    ]
+    matches.sort(key=lambda item: (-item[1], _path_key(item[0])))
+    matches = matches[:max(0, int(top_k))]
 
     if progress_callback:
         progress_callback(100)
-
-    elapsed = time.time() - t_start
-    return [
-        {"path": p, "similarity": s, "rank": idx + 1}
-        for idx, (p, s) in enumerate(results)
-    ], n_success, elapsed, error_paths, cache_info
+    results = [
+        {"path": path, "similarity": score, "rank": rank}
+        for rank, (path, score) in enumerate(matches, start=1)
+    ]
+    return results, len(target_paths), time.time() - started_at, error_paths, cache_info

@@ -18,7 +18,7 @@ if SCRIPT_DIR not in sys.path:
 
 from feature_extractor import (
     get_model, query_similar, find_duplicates,
-    load_features_cache, SUPPORTED_EXTS,
+    collect_image_paths, load_features_cache,
 )
 
 
@@ -45,6 +45,7 @@ def handle_query(cmd):
         recursive=cmd.get("recursive", True),
         progress_callback=progress_callback,
         cache_dir=cmd.get("cache_dir"),
+        excluded_directories=cmd.get("exclude_dirs", []),
     )
     result = {
         "type": "result",
@@ -55,6 +56,7 @@ def handle_query(cmd):
             {"image_path": r["path"], "similarity": r["similarity"], "rank": r["rank"]}
             for r in results_list
         ],
+        "failed_images": error_paths,
         "elapsed_seconds": round(elapsed, 2),
     }
     if cache_info is not None:
@@ -71,12 +73,14 @@ def handle_scan(cmd):
         recursive=cmd.get("recursive", False),
         progress_callback=progress_callback,
         cache_dir=cmd.get("cache_dir"),
+        excluded_directories=cmd.get("exclude_dirs", []),
     )
     result = {
         "type": "result",
         "total_images": total_images,
         "total_groups": len(groups),
         "groups": [{"id": i + 1, "images": g} for i, g in enumerate(groups)],
+        "failed_images": error_paths,
         "elapsed_seconds": round(elapsed, 2),
     }
     if cache_info is not None:
@@ -89,30 +93,14 @@ def handle_check_cache(cmd):
     folder = cmd["folder"]
     cache_dir = cmd.get("cache_dir")
     recursive = cmd.get("recursive", True)
+    excluded_directories = cmd.get("exclude_dirs", [])
 
-    # Collect current image paths (same logic as query_similar / find_duplicates)
-    current_paths = []
-    if recursive:
-        for root, dirs, files in os.walk(folder):
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            for f in files:
-                ext = os.path.splitext(f)[1].lower()
-                if ext in SUPPORTED_EXTS:
-                    current_paths.append(os.path.join(root, f))
-    else:
-        try:
-            for f in os.listdir(folder):
-                full = os.path.join(folder, f)
-                if os.path.isfile(full) and os.path.splitext(f)[1].lower() in SUPPORTED_EXTS:
-                    current_paths.append(full)
-        except FileNotFoundError:
-            write_response({"type": "result", "cache_info": None, "total_current": 0})
-            return
-
+    current_paths = collect_image_paths(folder, recursive, excluded_directories)
     total_current = len(current_paths)
 
     # Load cache (single call; returns paths, features, cache_info)
-    cached_paths, _, cache_info = load_features_cache(cache_dir, folder)
+    cached_paths, _, cache_info = load_features_cache(
+        cache_dir, folder, recursive, excluded_directories)
 
     if cache_info is None or cached_paths is None:
         write_response({"type": "result", "cache_info": None,

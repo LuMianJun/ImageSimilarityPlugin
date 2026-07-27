@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
@@ -28,12 +27,13 @@ namespace ImageSimilarityPlugin
             {
                 _quitRegistered = true;
                 EditorApplication.quitting += () => _instance?.Dispose();
+                AssemblyReloadEvents.beforeAssemblyReload += () => _instance?.Dispose();
             }
         }
 
         private Process _process;
         private StreamWriter _stdin;
-        private bool _ready;
+        private volatile bool _ready;
         private Action<float> _pendingProgress;
         private Action<string> _pendingResult;
         private Action<string> _pendingError;
@@ -51,6 +51,11 @@ namespace ImageSimilarityPlugin
                         _instance = new PythonSession();
                         _instance.Start();
                     }
+                    else if (_instance._process == null)
+                    {
+                        // 服务异常退出或被取消后，在下一次访问时自动恢复。
+                        _instance.Start();
+                    }
                     return _instance;
                 }
             }
@@ -65,6 +70,8 @@ namespace ImageSimilarityPlugin
 
         private void Start()
         {
+            if (_disposed || _process != null) return;
+
             string pythonPath = PythonLocator.GetPythonPath();
             if (string.IsNullOrEmpty(pythonPath))
             {
@@ -73,6 +80,12 @@ namespace ImageSimilarityPlugin
             }
 
             string scriptsDir = PythonRunner.GetPythonScriptsDir();
+            if (string.IsNullOrEmpty(scriptsDir))
+            {
+                UnityEngine.Debug.LogWarning("[PythonSession] 无法定位插件 Python 目录，请保持 ImageSimilarityPlugin 内部结构为 Editor/Python 同级。");
+                return;
+            }
+
             string serverPath = Path.Combine(scriptsDir, "query_server.py");
             if (!File.Exists(serverPath))
             {
@@ -82,7 +95,7 @@ namespace ImageSimilarityPlugin
 
             try
             {
-                _process = new Process
+                var process = new Process
                 {
                     StartInfo = new ProcessStartInfo
                     {
@@ -100,7 +113,7 @@ namespace ImageSimilarityPlugin
                     EnableRaisingEvents = true,
                 };
 
-                _process.ErrorDataReceived += (sender, e) =>
+                process.ErrorDataReceived += (sender, e) =>
                 {
                     if (string.IsNullOrEmpty(e.Data)) return;
                     if (e.Data.Contains("[server]"))
@@ -119,37 +132,62 @@ namespace ImageSimilarityPlugin
                     }
                 };
 
-                _process.OutputDataReceived += OnOutputLine;
+                process.OutputDataReceived += OnOutputLine;
 
-                _process.Exited += (sender, e) =>
+                process.Exited += (sender, e) =>
                 {
                     int code = -1;
-                    try { code = _process.ExitCode; } catch { }
+                    try { code = process.ExitCode; } catch { }
+
+                    Action<string> pendingError = null;
+                    lock (_lock)
+                    {
+                        if (ReferenceEquals(_process, process))
+                        {
+                            _ready = false;
+                            _process = null;
+                            _stdin = null;
+                            if (!_disposed)
+                            {
+                                pendingError = _pendingError;
+                                ClearPendingCallbacks();
+                            }
+                        }
+                    }
+
+                    try { process.Dispose(); } catch { }
+                    if (_disposed) return;
+
                     UnityEngine.Debug.LogWarning($"[PythonSession] Server process exited (code={code}). Will restart on next use.");
-                    _ready = false;
-                    try { _process?.Dispose(); } catch { }
-                    _process = null;
-                    _stdin = null;
+                    if (pendingError != null)
+                    {
+                        EditorApplication.delayCall += () =>
+                            pendingError($"Python server exited unexpectedly (code={code}).");
+                    }
                 };
 
-                _process.Start();
+                _process = process;
+                process.Start();
 
                 // Use new UTF8Encoding(false) to avoid emitting a BOM (0xEFBBBF).
                 // The BOM would prepend the first JSON line written to stdin, causing
                 // the Python server's json.loads() to fail with "Bad JSON" and hang
                 // the first query indefinitely.
-                _stdin = new StreamWriter(_process.StandardInput.BaseStream, new UTF8Encoding(false))
+                _stdin = new StreamWriter(process.StandardInput.BaseStream, new UTF8Encoding(false))
                 {
                     AutoFlush = true
                 };
 
-                _process.BeginOutputReadLine();
-                _process.BeginErrorReadLine();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
             }
             catch (Exception ex)
             {
                 UnityEngine.Debug.LogWarning($"[PythonSession] Failed to start: {ex.Message}");
                 _ready = false;
+                try { _process?.Dispose(); } catch { }
+                _process = null;
+                _stdin = null;
             }
         }
 
@@ -158,6 +196,7 @@ namespace ImageSimilarityPlugin
             lock (_lock)
             {
                 _disposed = true;
+                ClearPendingCallbacks();
                 try
                 {
                     if (_process != null && !_process.HasExited)
@@ -179,6 +218,33 @@ namespace ImageSimilarityPlugin
             }
         }
 
+        /// <summary>
+        /// 取消当前常驻命令。Python 推理本身不可中断，因此终止服务进程，
+        /// 下次访问 Instance 时会启动全新的服务。
+        /// </summary>
+        public void CancelCurrentCommand()
+        {
+            Process process;
+            lock (_lock)
+            {
+                if (_pendingResult == null && _pendingError == null) return;
+
+                ClearPendingCallbacks();
+                _ready = false;
+                process = _process;
+            }
+
+            try
+            {
+                if (process != null && !process.HasExited)
+                    process.Kill();
+            }
+            catch (Exception ex)
+            {
+                UnityEngine.Debug.LogWarning($"[PythonSession] 取消任务失败: {ex.Message}");
+            }
+        }
+
         // ==================================================================
         //  命令发送
         // ==================================================================
@@ -188,22 +254,19 @@ namespace ImageSimilarityPlugin
         /// 仅读取缓存 manifest 并对比文件系统 mtime。
         /// </summary>
         public void CheckCache(string folderPath, string cacheDir, bool recursive,
+            string[] excludedDirectories,
             Action<CacheInfo> onResult, Action<string> onError)
         {
-            var cmd = new System.Text.StringBuilder();
-            cmd.Append("{\"action\":\"check_cache\",\"folder\":\"");
-            cmd.Append(folderPath.Replace("\\", "\\\\").Replace("\"", "\\\""));
-            cmd.Append("\",\"recursive\":");
-            cmd.Append(recursive ? "true" : "false");
-            if (!string.IsNullOrEmpty(cacheDir))
+            string commandJson = JsonUtility.ToJson(new CheckCacheCommand
             {
-                cmd.Append(",\"cache_dir\":\"");
-                cmd.Append(cacheDir.Replace("\\", "\\\\").Replace("\"", "\\\""));
-                cmd.Append("\"");
-            }
-            cmd.Append("}");
+                action = "check_cache",
+                folder = folderPath,
+                cache_dir = cacheDir,
+                recursive = recursive,
+                exclude_dirs = excludedDirectories ?? Array.Empty<string>(),
+            });
 
-            SendCommand(cmd.ToString(),
+            SendCommand(commandJson,
                 onProgress: null,
                 onResult: json =>
                 {
@@ -227,6 +290,16 @@ namespace ImageSimilarityPlugin
             public CacheInfo cache_info;
         }
 
+        [Serializable]
+        private class CheckCacheCommand
+        {
+            public string action;
+            public string folder;
+            public string cache_dir;
+            public bool recursive;
+            public string[] exclude_dirs;
+        }
+
         /// <summary>
         /// 向持久化 Python 进程发送命令。
         /// </summary>
@@ -248,6 +321,13 @@ namespace ImageSimilarityPlugin
                     return;
                 }
 
+                if (_pendingResult != null || _pendingError != null)
+                {
+                    // 协议没有 request id，只允许串行命令，防止后发请求覆盖先发请求的回调。
+                    onError?.Invoke("Python server is busy — falling back to subprocess mode.");
+                    return;
+                }
+
                 _pendingProgress = onProgress;
                 _pendingResult = onResult;
                 _pendingError = onError;
@@ -259,11 +339,16 @@ namespace ImageSimilarityPlugin
                 catch (Exception ex)
                 {
                     _pendingError?.Invoke($"Failed to send command: {ex.Message}");
-                    _pendingProgress = null;
-                    _pendingResult = null;
-                    _pendingError = null;
+                    ClearPendingCallbacks();
                 }
             }
+        }
+
+        private void ClearPendingCallbacks()
+        {
+            _pendingProgress = null;
+            _pendingResult = null;
+            _pendingError = null;
         }
 
         // ==================================================================
@@ -279,8 +364,8 @@ namespace ImageSimilarityPlugin
 
             try
             {
-                var obj = MiniJsonParse(line);
-                string type = GetStringField(obj, "type");
+                var response = JsonUtility.FromJson<ResponseEnvelope>(line);
+                string type = response?.type;
 
                 if (type == "ready")
                 {
@@ -289,32 +374,38 @@ namespace ImageSimilarityPlugin
                 }
                 else if (type == "progress")
                 {
-                    int val = GetIntField(obj, "value", 0);
-                    float pct = val / 100f;
-                    EditorApplication.delayCall += () => _pendingProgress?.Invoke(pct);
+                    Action<float> callback;
+                    lock (_lock) callback = _pendingProgress;
+                    float pct = Mathf.Clamp01(response.value / 100f);
+                    if (callback != null)
+                        EditorApplication.delayCall += () => callback(pct);
                 }
                 else if (type == "result")
                 {
                     string json = line;
                     EditorApplication.delayCall += () =>
                     {
-                        var cb = _pendingResult;
-                        _pendingResult = null;
-                        _pendingProgress = null;
-                        _pendingError = null;
+                        Action<string> cb;
+                        lock (_lock)
+                        {
+                            cb = _pendingResult;
+                            ClearPendingCallbacks();
+                        }
                         cb?.Invoke(json);
                     };
                 }
                 else if (type == "error")
                 {
-                    string msg = GetStringField(obj, "message") ?? "Unknown error";
+                    string msg = string.IsNullOrEmpty(response.message) ? "Unknown error" : response.message;
                     UnityEngine.Debug.LogError($"[PythonSession] Server error: {msg}");
                     EditorApplication.delayCall += () =>
                     {
-                        var cb = _pendingError;
-                        _pendingResult = null;
-                        _pendingProgress = null;
-                        _pendingError = null;
+                        Action<string> cb;
+                        lock (_lock)
+                        {
+                            cb = _pendingError;
+                            ClearPendingCallbacks();
+                        }
                         cb?.Invoke(msg);
                     };
                 }
@@ -325,96 +416,12 @@ namespace ImageSimilarityPlugin
             }
         }
 
-        // ==================================================================
-        //  轻量 JSON 解析（避免依赖 Newtonsoft.Json）
-        // ==================================================================
-
-        private static Dictionary<string, object> MiniJsonParse(string json)
+        [Serializable]
+        private class ResponseEnvelope
         {
-            var dict = new Dictionary<string, object>();
-            json = json.Trim();
-            if (!json.StartsWith("{") || !json.EndsWith("}")) return dict;
-
-            string inner = json.Substring(1, json.Length - 2);
-            int i = 0;
-            while (i < inner.Length)
-            {
-                while (i < inner.Length && char.IsWhiteSpace(inner[i])) i++;
-                if (i >= inner.Length) break;
-
-                if (inner[i] != '"') break;
-                i++;
-                int keyStart = i;
-                while (i < inner.Length && inner[i] != '"')
-                {
-                    if (inner[i] == '\\') i++;
-                    i++;
-                }
-                string key = inner.Substring(keyStart, i - keyStart);
-                i++;
-
-                while (i < inner.Length && (char.IsWhiteSpace(inner[i]) || inner[i] == ':')) i++;
-
-                if (i >= inner.Length) break;
-                object value;
-                if (inner[i] == '"')
-                {
-                    i++;
-                    int valStart = i;
-                    while (i < inner.Length && inner[i] != '"')
-                    {
-                        if (inner[i] == '\\') i++;
-                        i++;
-                    }
-                    value = inner.Substring(valStart, i - valStart);
-                    i++;
-                }
-                else if (inner[i] == '-' || char.IsDigit(inner[i]))
-                {
-                    int valStart = i;
-                    while (i < inner.Length && (char.IsDigit(inner[i]) || inner[i] == '.' || inner[i] == '-')) i++;
-                    string numStr = inner.Substring(valStart, i - valStart);
-                    if (int.TryParse(numStr, out int intVal))
-                        value = intVal;
-                    else if (float.TryParse(numStr,
-                        System.Globalization.NumberStyles.Float,
-                        System.Globalization.CultureInfo.InvariantCulture, out float floatVal))
-                        value = floatVal;
-                    else
-                        value = numStr;
-                }
-                else
-                {
-                    int depth = 0;
-                    int valStart = i;
-                    while (i < inner.Length)
-                    {
-                        char c = inner[i];
-                        if (c == '{' || c == '[') depth++;
-                        else if (c == '}' || c == ']') depth--;
-                        else if (c == ',' && depth == 0) break;
-                        i++;
-                        if (depth == 0 && (c == '}' || c == ']')) break;
-                    }
-                    value = inner.Substring(valStart, i - valStart).Trim();
-                }
-                dict[key] = value;
-
-                while (i < inner.Length && (char.IsWhiteSpace(inner[i]) || inner[i] == ',')) i++;
-            }
-            return dict;
-        }
-
-        private static string GetStringField(Dictionary<string, object> dict, string key)
-        {
-            return dict.TryGetValue(key, out var val) ? val as string : null;
-        }
-
-        private static int GetIntField(Dictionary<string, object> dict, string key, int defaultValue)
-        {
-            if (dict.TryGetValue(key, out var val) && val is int intVal)
-                return intVal;
-            return defaultValue;
+            public string type;
+            public int value;
+            public string message;
         }
     }
 }

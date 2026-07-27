@@ -64,6 +64,10 @@ def main():
         "--cache-features", type=str, default=None,
         help="Directory for feature cache files (.npy + manifest). If omitted, no caching."
     )
+    parser.add_argument(
+        "--exclude", action="append", default=[],
+        help="Directory subtree to exclude. May be supplied multiple times."
+    )
 
     args = parser.parse_args()
 
@@ -72,8 +76,12 @@ def main():
         print(f"ERROR: Folder not found: {args.folder}", file=sys.stderr)
         sys.exit(1)
 
-    if not (0 < args.threshold <= 1):
+    if not (0 <= args.threshold <= 1):
         print("ERROR: Threshold must be between 0 and 1", file=sys.stderr)
+        sys.exit(1)
+
+    if args.workers < 1:
+        print("ERROR: Workers must be at least 1", file=sys.stderr)
         sys.exit(1)
 
     # Run detection
@@ -84,6 +92,7 @@ def main():
         recursive=args.recursive,
         progress_callback=progress_printer,
         cache_dir=args.cache_features,
+        excluded_directories=args.exclude,
     )
 
     # Build result
@@ -94,6 +103,7 @@ def main():
             {"id": idx + 1, "images": group}
             for idx, group in enumerate(groups)
         ],
+        "failed_images": error_paths,
         "elapsed_seconds": round(elapsed, 2),
     }
 
@@ -107,7 +117,8 @@ def main():
 
     # Print a final summary line (informational, Unity can parse if needed)
     sys.stdout.write(
-        f"DONE: {total_images} images, {len(groups)} groups, {elapsed:.2f}s\n"
+        f"DONE: {total_images} images, {len(groups)} groups, "
+        f"{len(error_paths)} failed, {elapsed:.2f}s\n"
     )
     sys.stdout.flush()
 

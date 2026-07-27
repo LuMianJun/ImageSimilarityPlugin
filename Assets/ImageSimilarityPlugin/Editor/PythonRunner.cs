@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using UnityEditor;
@@ -19,6 +20,7 @@ namespace ImageSimilarityPlugin
         private Process _process;
         private bool _isRunning;
         private bool _cancelled;
+        private bool _usingSession;
         private float _progress;
         private string _outputJsonPath;
 
@@ -32,13 +34,51 @@ namespace ImageSimilarityPlugin
         public event Action ProgressChanged;
 
         /// <summary>
-        /// 获取插件捆绑的 Python 脚本所在目录的绝对路径。
+        /// 获取插件捆绑的 Python 脚本所在目录的绝对路径。目录只能从当前脚本位置推导，避免插件移动后误用旧路径。
         /// </summary>
         public static string GetPythonScriptsDir()
         {
-            return Path.GetFullPath(Path.Combine(
-                Application.dataPath,
-                "ImageSimilarityPlugin", "Python"));
+            string scriptRelativePath = GetScriptRelativePythonScriptsDir();
+            if (!string.IsNullOrEmpty(scriptRelativePath) && Directory.Exists(scriptRelativePath))
+                return scriptRelativePath;
+
+            return null;
+        }
+
+        private static string GetScriptRelativePythonScriptsDir()
+        {
+            string scriptPath = GetCurrentScriptAssetPath();
+            if (string.IsNullOrEmpty(scriptPath)) return null;
+
+            string editorDir = Path.GetDirectoryName(scriptPath);
+            string pluginRoot = string.IsNullOrEmpty(editorDir) ? null : Path.GetDirectoryName(editorDir);
+            if (string.IsNullOrEmpty(pluginRoot)) return null;
+
+            // 插件内部结构固定为 Editor/Python 同级，依赖解析应跟随当前脚本实际位置。
+            string pythonAssetPath = Path.Combine(pluginRoot, "Python").Replace('\\', '/');
+            return Path.GetFullPath(Path.Combine(Application.dataPath, "..", pythonAssetPath));
+        }
+
+        private static string GetCurrentScriptAssetPath()
+        {
+            string[] guids = AssetDatabase.FindAssets($"{nameof(PythonRunner)} t:MonoScript");
+            foreach (string guid in guids)
+            {
+                string assetPath = AssetDatabase.GUIDToAssetPath(guid);
+                if (string.IsNullOrEmpty(assetPath)) continue;
+                if (!assetPath.EndsWith("/" + nameof(PythonRunner) + ".cs", StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                try
+                {
+                    var script = AssetDatabase.LoadAssetAtPath<MonoScript>(assetPath);
+                    if (script != null && script.GetClass() == typeof(PythonRunner))
+                        return assetPath;
+                }
+                catch { }
+            }
+
+            return null;
         }
 
         /// <summary>
@@ -47,15 +87,26 @@ namespace ImageSimilarityPlugin
         public void Cancel()
         {
             _cancelled = true;
+            bool waitForSubprocessExit = false;
+            if (_usingSession)
+            {
+                // 常驻服务一次只处理一个命令；取消时重启服务，避免旧任务继续占用会话。
+                PythonSession.Instance.CancelCurrentCommand();
+                _usingSession = false;
+            }
             try
             {
-                if (_process != null && !_process.HasExited)
+                if (_process != null)
                 {
-                    _process.Kill();
+                    waitForSubprocessExit = true;
+                    if (!_process.HasExited)
+                        _process.Kill();
                 }
             }
             catch { }
-            _isRunning = false;
+            // 子进程退出回调负责收尾；常驻会话没有对应回调，需要立即复位。
+            if (!waitForSubprocessExit)
+                _isRunning = false;
             CleanupTempFile();
         }
 
@@ -72,43 +123,54 @@ namespace ImageSimilarityPlugin
             bool recursive,
             int workers,
             string cacheFeaturesDir = null,
+            string[] excludedDirectories = null,
             Action<ScanResultData> onComplete = null,
             Action<string> onError = null)
         {
             if (_isRunning) { onError?.Invoke("已有任务正在运行。"); return; }
 
-            if (!ValidateEnvironment("duplicate_detector_cli.py", onError)) return;
-            if (!Directory.Exists(folderPath)) { onError?.Invoke($"文件夹不存在: {folderPath}"); return; }
+            if (!ValidateEnvironment("duplicate_detector_cli.py", out string scriptsDir, onError)) return;
+            if (!Directory.Exists(folderPath))
+            {
+                onError?.Invoke($"文件夹不存在: {PluginUtils.ToDisplayPath(folderPath)}");
+                return;
+            }
+            if (threshold < 0f || threshold > 1f) { onError?.Invoke("相似度阈值必须在 0 到 1 之间。"); return; }
+            if (workers < 1) { onError?.Invoke("线程数必须大于或等于 1。"); return; }
 
-            _outputJsonPath = Path.Combine(Application.temporaryCachePath, "similarity_result.json");
+            _outputJsonPath = CreateOutputPath("similarity_result");
+            string[] excludedDirectorySnapshot = GetExcludedDirectorySnapshot(excludedDirectories);
 
             var sb = new StringBuilder();
-            sb.Append("\"").Append(Path.Combine(GetPythonScriptsDir(), "duplicate_detector_cli.py")).Append("\"");
+            sb.Append("\"").Append(Path.Combine(scriptsDir, "duplicate_detector_cli.py")).Append("\"");
             sb.Append(" --folder \"").Append(folderPath).Append("\"");
-            sb.Append(" --threshold ").Append(threshold.ToString("F4"));
+            sb.Append(" --threshold ").Append(threshold.ToString("F4", CultureInfo.InvariantCulture));
             sb.Append(" --output \"").Append(_outputJsonPath).Append("\"");
             sb.Append(" --workers ").Append(workers);
             if (recursive) sb.Append(" --recursive");
             if (!string.IsNullOrEmpty(cacheFeaturesDir))
                 sb.Append(" --cache-features \"").Append(cacheFeaturesDir).Append("\"");
+            AppendExcludedDirectoryArguments(sb, excludedDirectorySnapshot);
 
             // Build session command for persistent server (fast path)
             string sessionCmd = null;
             if (!string.IsNullOrEmpty(cacheFeaturesDir))
             {
-                sessionCmd = BuildSessionCommand("scan",
-                    new[] {
-                        ("folder", folderPath),
-                        ("threshold", threshold.ToString("F4")),
-                        ("workers", workers.ToString()),
-                        ("recursive", recursive ? "true" : "false"),
-                        ("cache_dir", cacheFeaturesDir),
-                    });
+                sessionCmd = JsonUtility.ToJson(new SessionCommand
+                {
+                    action = "scan",
+                    folder = folderPath,
+                    threshold = threshold,
+                    workers = workers,
+                    recursive = recursive,
+                    cache_dir = cacheFeaturesDir,
+                    exclude_dirs = excludedDirectorySnapshot,
+                });
             }
 
             RunAsync(sb.ToString(),
                 json => JsonUtility.FromJson<ScanResultData>(json),
-                onComplete, onError, sessionCmd);
+                onComplete, onError, sessionCmd, scriptsDir);
         }
 
         /// <summary>
@@ -123,50 +185,59 @@ namespace ImageSimilarityPlugin
             int workers,
             bool useCache,
             Action<QueryResultData> onComplete,
-            Action<string> onError)
+            Action<string> onError,
+            string[] excludedDirectories = null)
         {
             if (_isRunning) { onError?.Invoke("已有任务正在运行。"); return; }
 
-            if (!ValidateEnvironment("image_query_cli.py", onError)) return;
+            if (!ValidateEnvironment("image_query_cli.py", out string scriptsDir, onError)) return;
             if (!File.Exists(queryImagePath)) { onError?.Invoke($"查询图片不存在: {queryImagePath}"); return; }
-            if (!Directory.Exists(folderPath)) { onError?.Invoke($"文件夹不存在: {folderPath}"); return; }
+            if (!Directory.Exists(folderPath))
+            {
+                onError?.Invoke($"文件夹不存在: {PluginUtils.ToDisplayPath(folderPath)}");
+                return;
+            }
+            if (threshold < 0f || threshold > 1f) { onError?.Invoke("相似度阈值必须在 0 到 1 之间。"); return; }
+            if (topK < 1) { onError?.Invoke("最大结果数必须大于或等于 1。"); return; }
+            if (workers < 1) { onError?.Invoke("线程数必须大于或等于 1。"); return; }
 
-            _outputJsonPath = Path.Combine(Application.temporaryCachePath, "query_result.json");
+            _outputJsonPath = CreateOutputPath("query_result");
 
             string cacheDir = null;
             if (useCache)
                 cacheDir = Path.Combine(Application.temporaryCachePath, "ImageSimilarityPlugin", "features");
+            string[] excludedDirectorySnapshot = GetExcludedDirectorySnapshot(excludedDirectories);
 
             var sb = new StringBuilder();
-            sb.Append("\"").Append(Path.Combine(GetPythonScriptsDir(), "image_query_cli.py")).Append("\"");
+            sb.Append("\"").Append(Path.Combine(scriptsDir, "image_query_cli.py")).Append("\"");
             sb.Append(" --query \"").Append(queryImagePath).Append("\"");
             sb.Append(" --folder \"").Append(folderPath).Append("\"");
-            sb.Append(" --threshold ").Append(threshold.ToString("F4"));
+            sb.Append(" --threshold ").Append(threshold.ToString("F4", CultureInfo.InvariantCulture));
             sb.Append(" --top-k ").Append(topK);
             sb.Append(" --output \"").Append(_outputJsonPath).Append("\"");
             sb.Append(" --workers ").Append(workers);
             if (recursive) sb.Append(" --recursive");
             if (cacheDir != null)
                 sb.Append(" --cache \"").Append(cacheDir).Append("\"");
+            AppendExcludedDirectoryArguments(sb, excludedDirectorySnapshot);
 
             // Build session command for persistent server (fast path)
-            var cmdParams = new (string key, string value)[]
+            string sessionCmd = JsonUtility.ToJson(new SessionCommand
             {
-                ("query", queryImagePath),
-                ("folder", folderPath),
-                ("threshold", threshold.ToString("F4")),
-                ("top_k", topK.ToString()),
-                ("workers", workers.ToString()),
-                ("recursive", recursive ? "true" : "false"),
-            };
-            string sessionCmd = BuildSessionCommand("query", cmdParams,
-                cacheDir != null
-                    ? new[] { ("cache_dir", cacheDir) }
-                    : null);
+                action = "query",
+                query = queryImagePath,
+                folder = folderPath,
+                threshold = threshold,
+                top_k = topK,
+                workers = workers,
+                recursive = recursive,
+                cache_dir = cacheDir,
+                exclude_dirs = excludedDirectorySnapshot,
+            });
 
             RunAsync(sb.ToString(),
                 json => JsonUtility.FromJson<QueryResultData>(json),
-                onComplete, onError, sessionCmd);
+                onComplete, onError, sessionCmd, scriptsDir);
         }
 
         // ==================================================================
@@ -174,8 +245,9 @@ namespace ImageSimilarityPlugin
         // ==================================================================
 
         /// <summary>验证 Python 和 CLI 脚本可用</summary>
-        private bool ValidateEnvironment(string cliScriptName, Action<string> onError)
+        private bool ValidateEnvironment(string cliScriptName, out string scriptsDir, Action<string> onError)
         {
+            scriptsDir = null;
             string pythonPath = PythonLocator.GetPythonPath();
             if (string.IsNullOrEmpty(pythonPath))
             {
@@ -183,7 +255,13 @@ namespace ImageSimilarityPlugin
                 return false;
             }
 
-            string scriptsDir = GetPythonScriptsDir();
+            scriptsDir = GetPythonScriptsDir();
+            if (string.IsNullOrEmpty(scriptsDir))
+            {
+                onError?.Invoke("无法定位插件 Python 目录。请保持 ImageSimilarityPlugin 内部结构为 Editor/Python 同级。");
+                return false;
+            }
+
             string cliPath = Path.Combine(scriptsDir, cliScriptName);
             if (!File.Exists(cliPath))
             {
@@ -210,7 +288,8 @@ namespace ImageSimilarityPlugin
             Func<string, T> deserializer,
             Action<T> onComplete,
             Action<string> onError,
-            string sessionCmd = null)
+            string sessionCmd = null,
+            string scriptsDir = null)
         {
             // Try persistent session first (fast path)
             if (!string.IsNullOrEmpty(sessionCmd) && PythonSession.Instance.IsReady)
@@ -218,6 +297,7 @@ namespace ImageSimilarityPlugin
                 _cancelled = false;
                 _progress = 0f;
                 _isRunning = true;
+                _usingSession = true;
 
                 PythonSession.Instance.SendCommand(
                     sessionCmd,
@@ -228,6 +308,7 @@ namespace ImageSimilarityPlugin
                     },
                     onResult: resultJson =>
                     {
+                        _usingSession = false;
                         _isRunning = false;
                         if (_cancelled) return;
                         try
@@ -245,15 +326,17 @@ namespace ImageSimilarityPlugin
                     },
                     onError: err =>
                     {
+                        _usingSession = false;
+                        if (_cancelled) return;
                         UnityEngine.Debug.LogWarning($"[PythonRunner] Session unavailable ({err}), falling back to subprocess.");
                         _isRunning = false;
-                        RunSubprocess(args, deserializer, onComplete, onError);
+                        RunSubprocess(args, deserializer, onComplete, onError, scriptsDir);
                     }
                 );
                 return;
             }
 
-            RunSubprocess(args, deserializer, onComplete, onError);
+            RunSubprocess(args, deserializer, onComplete, onError, scriptsDir);
         }
 
         /// <summary>回退路径：启动独立 Python 子进程。</summary>
@@ -261,17 +344,26 @@ namespace ImageSimilarityPlugin
             string args,
             Func<string, T> deserializer,
             Action<T> onComplete,
-            Action<string> onError)
+            Action<string> onError,
+            string scriptsDir)
         {
             string pythonPath = PythonLocator.GetPythonPath();
-            string scriptsDir = GetPythonScriptsDir();
+            if (string.IsNullOrEmpty(scriptsDir))
+            {
+                onError?.Invoke("无法定位插件 Python 目录。请保持 ImageSimilarityPlugin 内部结构为 Editor/Python 同级。");
+                return;
+            }
 
             _cancelled = false;
             _progress = 0f;
+            _usingSession = false;
+            string outputJsonPath = _outputJsonPath;
 
+            Process process = null;
             try
             {
-                _process = new Process
+                var stderr = new StringBuilder();
+                process = new Process
                 {
                     StartInfo = new ProcessStartInfo
                     {
@@ -288,10 +380,11 @@ namespace ImageSimilarityPlugin
                     EnableRaisingEvents = true,
                 };
 
-                _process.ErrorDataReceived += (sender, e) =>
+                process.ErrorDataReceived += (sender, e) =>
                 {
                     if (!string.IsNullOrEmpty(e.Data))
                     {
+                        lock (stderr) stderr.AppendLine(e.Data);
                         if (!e.Data.StartsWith("WARNING:") &&
                             !e.Data.StartsWith("I0000") &&
                             !e.Data.Contains("oneDNN"))
@@ -301,43 +394,54 @@ namespace ImageSimilarityPlugin
                     }
                 };
 
-                _process.OutputDataReceived += (sender, e) =>
+                process.OutputDataReceived += (sender, e) =>
                 {
                     if (string.IsNullOrEmpty(e.Data) || _cancelled) return;
                     if (e.Data.StartsWith("PROGRESS:"))
                     {
                         string numStr = e.Data.Substring("PROGRESS:".Length).Trim();
                         if (int.TryParse(numStr, out int pct))
-                            _progress = pct / 100f;
+                        {
+                            _progress = Mathf.Clamp01(pct / 100f);
+                            EditorApplication.delayCall += () => ProgressChanged?.Invoke();
+                        }
                     }
                 };
 
-                _process.Exited += (sender, e) =>
+                process.Exited += (sender, e) =>
                 {
-                    _isRunning = false;
-                    try { _process.WaitForExit(); } catch { }
-
-                    if (_cancelled) { CleanupTempFile(); return; }
-
-                    if (_process.ExitCode != 0)
-                    {
-                        string errMsg = "Python 进程异常退出，错误码: " + _process.ExitCode;
-                        UnityEngine.Debug.LogError(errMsg);
-                        EditorApplication.delayCall += () => onError?.Invoke(errMsg);
-                        return;
-                    }
+                    try { process.WaitForExit(); } catch { }
+                    int exitCode = -1;
+                    try { exitCode = process.ExitCode; } catch { }
+                    string errorOutput;
+                    lock (stderr) errorOutput = stderr.ToString().Trim();
 
                     EditorApplication.delayCall += () =>
                     {
                         try
                         {
-                            if (!File.Exists(_outputJsonPath))
+                            if (ReferenceEquals(_process, process))
+                                _process = null;
+                            _isRunning = false;
+
+                            if (_cancelled) return;
+
+                            if (exitCode != 0)
+                            {
+                                string detail = string.IsNullOrEmpty(errorOutput)
+                                    ? string.Empty
+                                    : $"\n{errorOutput}";
+                                onError?.Invoke($"Python 进程异常退出，错误码: {exitCode}{detail}");
+                                return;
+                            }
+
+                            if (!File.Exists(outputJsonPath))
                             {
                                 onError?.Invoke("未找到结果文件，任务可能失败。");
                                 return;
                             }
 
-                            string json = File.ReadAllText(_outputJsonPath, Encoding.UTF8);
+                            string json = File.ReadAllText(outputJsonPath, Encoding.UTF8);
                             T result = deserializer(json);
 
                             if (result == null)
@@ -354,61 +458,80 @@ namespace ImageSimilarityPlugin
                         }
                         finally
                         {
-                            CleanupTempFile();
+                            CleanupTempFile(outputJsonPath);
+                            try { process.Dispose(); } catch { }
                         }
                     };
                 };
 
                 _isRunning = true;
                 _progress = 0f;
-                _process.Start();
-                _process.BeginOutputReadLine();
-                _process.BeginErrorReadLine();
+                _process = process;
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
             }
             catch (Exception ex)
             {
                 _isRunning = false;
+                if (ReferenceEquals(_process, process))
+                    _process = null;
+                try { process?.Dispose(); } catch { }
+                CleanupTempFile();
                 onError?.Invoke($"启动 Python 失败: {ex.Message}");
+            }
+        }
+
+        private static string CreateOutputPath(string prefix)
+        {
+            string directory = Path.Combine(Application.temporaryCachePath, "ImageSimilarityPlugin", "results");
+            Directory.CreateDirectory(directory);
+            return Path.Combine(directory, $"{prefix}_{Guid.NewGuid():N}.json");
+        }
+
+        /// <summary>任务启动时复制排除目录，避免异步执行期间设置变化。</summary>
+        private static string[] GetExcludedDirectorySnapshot(string[] excludedDirectories)
+        {
+            string[] source = excludedDirectories ?? ExcludedDirectorySettings.GetDirectories();
+            return source == null ? Array.Empty<string>() : (string[])source.Clone();
+        }
+
+        private static void AppendExcludedDirectoryArguments(StringBuilder builder, string[] excludedDirectories)
+        {
+            foreach (string directory in excludedDirectories)
+            {
+                if (!string.IsNullOrWhiteSpace(directory))
+                    builder.Append(" --exclude \"").Append(directory).Append("\"");
             }
         }
 
         private void CleanupTempFile()
         {
+            CleanupTempFile(_outputJsonPath);
+        }
+
+        private static void CleanupTempFile(string outputJsonPath)
+        {
             try
             {
-                if (File.Exists(_outputJsonPath))
-                    File.Delete(_outputJsonPath);
+                if (!string.IsNullOrEmpty(outputJsonPath) && File.Exists(outputJsonPath))
+                    File.Delete(outputJsonPath);
             }
             catch { }
         }
 
-        /// <summary>用 StringBuilder 拼出带 action 字段的 JSON 命令，保证格式正确。</summary>
-        private static string BuildSessionCommand(string action,
-            (string key, string value)[] required,
-            (string key, string value)[] optional = null)
+        [Serializable]
+        private class SessionCommand
         {
-            var sb = new StringBuilder();
-            sb.Append("{\"action\":\"").Append(action).Append("\"");
-            foreach (var (k, v) in required)
-                AppendJsonField(sb, k, v);
-            if (optional != null)
-                foreach (var (k, v) in optional)
-                    AppendJsonField(sb, k, v);
-            sb.Append("}");
-            return sb.ToString();
-        }
-
-        private static void AppendJsonField(StringBuilder sb, string key, string value)
-        {
-            sb.Append(",\"").Append(key).Append("\":");
-            // Heuristic: if value looks like a number or bool literal, emit as-is;
-            // otherwise emit as a JSON string.
-            bool isLiteral = value == "true" || value == "false"
-                || (value.Length > 0 && (char.IsDigit(value[0]) || value[0] == '-'));
-            if (isLiteral)
-                sb.Append(value);
-            else
-                sb.Append("\"").Append(value.Replace("\\", "\\\\").Replace("\"", "\\\"")).Append("\"");
+            public string action;
+            public string query;
+            public string folder;
+            public float threshold;
+            public int top_k;
+            public int workers;
+            public bool recursive;
+            public string cache_dir;
+            public string[] exclude_dirs;
         }
     }
 }

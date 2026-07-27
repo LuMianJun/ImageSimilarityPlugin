@@ -22,6 +22,9 @@ namespace ImageSimilarityPlugin
         /// <summary>扫描耗时（秒）</summary>
         public double elapsed_seconds;
 
+        /// <summary>读取或特征提取失败、已跳过的图片路径</summary>
+        public List<string> failed_images;
+
         /// <summary>特征缓存更新信息（持久会话命中时有值）</summary>
         public CacheInfo cache_info;
     }
@@ -60,6 +63,9 @@ namespace ImageSimilarityPlugin
 
         /// <summary>查询耗时（秒）</summary>
         public double elapsed_seconds;
+
+        /// <summary>读取或特征提取失败、已跳过的图片路径</summary>
+        public List<string> failed_images;
 
         /// <summary>特征缓存更新信息（持久会话命中时有值，子进程回退时可能为 null）</summary>
         public CacheInfo cache_info;

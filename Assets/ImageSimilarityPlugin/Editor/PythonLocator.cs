@@ -74,6 +74,8 @@ namespace ImageSimilarityPlugin
                     _cachedPath = candidate;
                     _cachedPathResolved = true;
                     EditorPrefs.SetString(PYTHON_PATH_KEY, candidate);
+                    if (!string.Equals(saved, candidate, StringComparison.OrdinalIgnoreCase))
+                        EditorPrefs.SetBool(DEPENDENCIES_CHECKED_KEY, false);
                     return _cachedPath;
                 }
             }
@@ -95,6 +97,8 @@ namespace ImageSimilarityPlugin
                 _cachedPath = path;
                 _cachedPathResolved = true;
                 EditorPrefs.SetString(PYTHON_PATH_KEY, path);
+                // 解释器切换后必须重新检查依赖，不能沿用上一个 Python 的检测结果。
+                EditorPrefs.SetBool(DEPENDENCIES_CHECKED_KEY, false);
                 return true;
             }
             return false;
@@ -109,34 +113,20 @@ namespace ImageSimilarityPlugin
             string pythonPath = GetPythonPath();
             if (pythonPath == null) return null;
 
-            try
-            {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = pythonPath,
-                    Arguments = "--version",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-                using (var proc = Process.Start(psi))
-                {
-                    // --version 会输出到 stderr 而非 stdout
-                    string output = proc.StandardOutput.ReadToEnd() + proc.StandardError.ReadToEnd();
-                    proc.WaitForExit(5000);
-                    return output.Trim();
-                }
-            }
-            catch
-            {
+            if (!TryRunPython(pythonPath, "--version", 5000, out string output, out int exitCode)
+                || exitCode != 0)
                 return null;
-            }
+
+            string version = output.Trim();
+            const string prefix = "Python ";
+            return version.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                ? version.Substring(prefix.Length)
+                : version;
         }
 
         /// <summary>
-        /// 检查 pip 依赖（tensorflow, numpy, PIL, sklearn, tqdm）是否已安装。
-        /// 通过尝试 import 所有所需模块来判断，超时 15 秒。
+        /// 检查 pip 依赖是否已安装。
+        /// 这里只检查模块规格是否存在，避免实际 import TensorFlow 导致冷启动超时并误判为缺少依赖。
         /// </summary>
         public static bool AreDependenciesInstalled()
         {
@@ -145,21 +135,9 @@ namespace ImageSimilarityPlugin
 
             try
             {
-                var psi = new ProcessStartInfo
-                {
-                    FileName = pythonPath,
-                    // 一次性尝试导入所有依赖模块
-                    Arguments = "-c \"import tensorflow; import numpy; import PIL; import sklearn; import tqdm\"",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    CreateNoWindow = true
-                };
-                using (var proc = Process.Start(psi))
-                {
-                    proc.WaitForExit(15000);
-                    return proc.ExitCode == 0;
-                }
+                const string args = "-c \"import importlib.util, sys; mods=('tensorflow','numpy','PIL'); missing=[m for m in mods if importlib.util.find_spec(m) is None]; print(','.join(missing)); sys.exit(1 if missing else 0)\"";
+                return TryRunPython(pythonPath, args, 15000, out _, out int exitCode)
+                    && exitCode == 0;
             }
             catch
             {
@@ -185,12 +163,37 @@ namespace ImageSimilarityPlugin
         /// </summary>
         private static bool ValidatePython(string path)
         {
+            const string args = "-c \"import sys; v=sys.version_info; print(f'{v.major}.{v.minor}.{v.micro}')\"";
+            if (!TryRunPython(path, args, 5000, out string output, out int exitCode) || exitCode != 0)
+                return false;
+
+            var parts = output.Trim().Split('.');
+            if (parts.Length < 2 || !int.TryParse(parts[0], out int major)
+                || !int.TryParse(parts[1], out int minor))
+                return false;
+
+            return major > 3 || (major == 3 && minor >= 6);
+        }
+
+        /// <summary>
+        /// 执行输出量很小的 Python 探测命令，并在超时后回收进程。
+        /// </summary>
+        private static bool TryRunPython(
+            string pythonPath,
+            string arguments,
+            int timeoutMilliseconds,
+            out string output,
+            out int exitCode)
+        {
+            output = null;
+            exitCode = -1;
+
             try
             {
                 var psi = new ProcessStartInfo
                 {
-                    FileName = path,
-                    Arguments = "-c \"import sys; v=sys.version_info; print(f'{v.major}.{v.minor}.{v.micro}')\"",
+                    FileName = pythonPath,
+                    Arguments = arguments,
                     UseShellExecute = false,
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
@@ -198,25 +201,22 @@ namespace ImageSimilarityPlugin
                 };
                 using (var proc = Process.Start(psi))
                 {
-                    string output = proc.StandardOutput.ReadToEnd().Trim();
-                    proc.WaitForExit(5000);
-
-                    if (proc.ExitCode == 0 && !string.IsNullOrEmpty(output))
+                    if (proc == null) return false;
+                    if (!proc.WaitForExit(timeoutMilliseconds))
                     {
-                        // 解析版本号，要求 >= 3.6
-                        var parts = output.Split('.');
-                        if (parts.Length >= 2 && int.TryParse(parts[0], out int major))
-                        {
-                            return major >= 3 || (major == 3 && parts.Length >= 2 && int.TryParse(parts[1], out int minor) && minor >= 6);
-                        }
+                        try { proc.Kill(); } catch { }
+                        return false;
                     }
+
+                    output = proc.StandardOutput.ReadToEnd() + proc.StandardError.ReadToEnd();
+                    exitCode = proc.ExitCode;
+                    return true;
                 }
             }
             catch
             {
-                // 命令未找到或执行失败
+                return false;
             }
-            return false;
         }
     }
 }

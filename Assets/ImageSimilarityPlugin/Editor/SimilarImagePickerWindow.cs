@@ -17,6 +17,7 @@ namespace ImageSimilarityPlugin
         // ===== 输入参数 =====
         private string _queryImagePath;
         private string _queryImageName;
+        private string _folderPath;
         private QueryResultData _results;
         private Action<string> _onPicked;       // 选中回调，参数为选中图片的绝对路径；null 表示未选
         private Action _onCancelled;            // 取消/关闭回调
@@ -27,6 +28,7 @@ namespace ImageSimilarityPlugin
         private bool _statusIsError;
         private bool _isSearching;
         private bool _hasSearched;
+        private bool _callbackInvoked;
 
         // ===== UI 缓存 =====
         private Vector2 _scrollPos;
@@ -52,9 +54,12 @@ namespace ImageSimilarityPlugin
             Action<string> onPicked,
             Action onCancelled)
         {
-            var win = GetWindow<SimilarImagePickerWindow>(true, "相似图片选择器");
+            // 每次调用独立建窗，避免并发导入流程复用窗口并覆盖彼此的回调。
+            var win = CreateInstance<SimilarImagePickerWindow>();
+            win.titleContent = new GUIContent("相似图片选择器");
             win._queryImagePath = queryImagePath;
             win._queryImageName = Path.GetFileName(queryImagePath);
+            win._folderPath = folderPath;
             win._results = null;
             win._onPicked = onPicked;
             win._onCancelled = onCancelled;
@@ -62,8 +67,7 @@ namespace ImageSimilarityPlugin
             win._statusIsError = false;
             win._isSearching = true;
             win._hasSearched = false;
-            win._thumbnailCache.Clear();
-            win._queryPreview = null;
+            win._callbackInvoked = false;
             win.minSize = new Vector2(520, 400);
             win.maxSize = new Vector2(800, 900);
 
@@ -77,7 +81,7 @@ namespace ImageSimilarityPlugin
                 onError: err => win.OnQueryError(err)
             );
 
-            win.Show();
+            win.ShowUtility();
             return win;
         }
 
@@ -85,6 +89,8 @@ namespace ImageSimilarityPlugin
         {
             _runner?.Cancel();
             ClearThumbnailCache();
+            if (!_callbackInvoked)
+                CompleteSelection(null, true);
         }
 
         // ==================================================================
@@ -93,18 +99,33 @@ namespace ImageSimilarityPlugin
 
         private void OnQueryComplete(QueryResultData result)
         {
+            var imagePaths = new List<string>();
+            if (result?.results != null)
+            {
+                foreach (SimilarImage image in result.results)
+                    if (!string.IsNullOrEmpty(image?.image_path))
+                        imagePaths.Add(image.image_path);
+            }
+            FR2Integration.RefreshReferenceCountsIfPending(
+                imagePaths,
+                _ => { if (this != null) Repaint(); });
             _results = result;
             _isSearching = false;
             _hasSearched = true;
 
-            if (result.results.Count == 0)
+            if (result?.results == null || result.results.Count == 0)
             {
-                _statusMessage = $"未找到与 \"{_queryImageName}\" 相似的图片。\n你可以关闭窗口，继续使用原图。";
+                int failedCount = result?.failed_images?.Count ?? 0;
+                _statusMessage = $"未找到与 \"{_queryImageName}\" 相似的图片。" +
+                                 (failedCount > 0 ? $" 跳过 {failedCount} 张处理失败的图片。" : string.Empty) +
+                                 "\n你可以关闭窗口，继续使用原图。";
                 _statusIsError = false;
             }
             else
             {
-                _statusMessage = $"找到 {result.results.Count} 张相似图片（共扫描 {result.total_images} 张，耗时 {result.elapsed_seconds:F1} 秒）";
+                int failedCount = result.failed_images?.Count ?? 0;
+                _statusMessage = $"找到 {result.results.Count} 张相似图片（共扫描 {result.total_images} 张，耗时 {result.elapsed_seconds:F1} 秒）" +
+                                 (failedCount > 0 ? $"，跳过 {failedCount} 张处理失败的图片" : string.Empty);
                 _statusIsError = false;
             }
             Repaint();
@@ -171,6 +192,11 @@ namespace ImageSimilarityPlugin
             EditorGUILayout.LabelField("查询图片 — 原图属性", EditorStyles.boldLabel);
             EditorGUILayout.LabelField(_queryImageName, EditorStyles.wordWrappedLabel);
 
+            string displayFolder = PluginUtils.ToDisplayPath(_folderPath);
+            EditorGUILayout.LabelField(
+                $"搜索目录: {displayFolder}",
+                EditorStyles.wordWrappedMiniLabel);
+
             // 原图文件大小
             try
             {
@@ -219,7 +245,7 @@ namespace ImageSimilarityPlugin
             if (GUILayout.Button("取消", GUILayout.Width(80), GUILayout.Height(28)))
             {
                 _runner?.Cancel();
-                _onCancelled?.Invoke();
+                CompleteSelection(null, true);
                 Close();
             }
             EditorGUILayout.EndHorizontal();
@@ -238,7 +264,7 @@ namespace ImageSimilarityPlugin
                 GUI.color = Color.white;
             }
 
-            if (_results == null || _results.results.Count == 0)
+            if (_results?.results == null || _results.results.Count == 0)
                 return;
 
             EditorGUILayout.LabelField("相似图片 — 点击选择一个:", EditorStyles.boldLabel);
@@ -284,9 +310,9 @@ namespace ImageSimilarityPlugin
             // 文件信息
             EditorGUILayout.BeginVertical();
             EditorGUILayout.LabelField(Path.GetFileName(img.image_path), EditorStyles.boldLabel);
-            string assetPath = PluginUtils.AbsoluteToAssetPath(img.image_path);
+            string displayPath = PluginUtils.ToDisplayPath(img.image_path);
             EditorGUILayout.LabelField(
-                string.IsNullOrEmpty(assetPath) ? img.image_path : assetPath,
+                new GUIContent(displayPath, displayPath),
                 EditorStyles.miniLabel);
             try
             {
@@ -320,7 +346,7 @@ namespace ImageSimilarityPlugin
             GUI.backgroundColor = new Color(0.4f, 0.8f, 0.4f);
             if (GUILayout.Button("✔ 选择此图片替代导入", GUILayout.Height(28)))
             {
-                _onPicked?.Invoke(img.image_path);
+                CompleteSelection(img.image_path, false);
                 Close();
             }
             GUI.backgroundColor = Color.white;
@@ -340,12 +366,45 @@ namespace ImageSimilarityPlugin
 
             if (GUILayout.Button("不选择，使用原图导入", GUILayout.Height(30), GUILayout.Width(200)))
             {
-                _onPicked?.Invoke(null);  // null = 不替换
+                CompleteSelection(null, false);
                 Close();
             }
 
             GUILayout.FlexibleSpace();
             EditorGUILayout.EndHorizontal();
+        }
+
+        /// <summary>
+        /// 确保窗口无论通过按钮、取消还是右上角关闭，都只回调一次。
+        /// </summary>
+        private void CompleteSelection(string selectedPath, bool cancelled)
+        {
+            if (_callbackInvoked) return;
+            _callbackInvoked = true;
+
+            Action<string> picked = _onPicked;
+            Action onCancelled = _onCancelled;
+            _onPicked = null;
+            _onCancelled = null;
+
+            try
+            {
+                picked?.Invoke(selectedPath);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogException(ex);
+            }
+
+            if (!cancelled) return;
+            try
+            {
+                onCancelled?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                Debug.LogException(ex);
+            }
         }
 
         // ==================================================================

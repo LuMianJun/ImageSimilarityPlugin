@@ -29,24 +29,45 @@ namespace ImageSimilarityPlugin
         private string _pythonVersion = null;
         private bool _depsInstalled = false;
         private bool _checkingDeps = false;
-        private bool _fr2Ready = false;
+        private double _nextFr2RepaintTime = 0d;
+        private bool CanStartRunner => !string.IsNullOrEmpty(_pythonVersion)
+            && _depsInstalled
+            && !_runner.IsRunning;
 
         // ===== 扫描结果缓存 =====
         private static string CacheDir => Path.Combine(Application.temporaryCachePath, "ImageSimilarityPlugin");
         private string _cachePath;         // 当前文件夹对应的缓存文件路径
         private string _lastCheckedFolder; // 上一次检查缓存的文件夹，用于检测变化
+        private bool _lastCheckedRecursive;
+        private string _lastCheckedExclusionScope;
         private string _lastFeatureCheckFolder; // 上一次检查特征缓存过期的文件夹
+        private bool _lastFeatureCheckRecursive;
+        private string _lastFeatureCheckExclusionScope;
         private bool _pendingFeatureCheck;  // 等待 session ready 后重试
         private bool _hasCache;            // 是否有有效缓存可用
         private string _cacheInfo;         // 缓存摘要信息（用于 UI 显示）
         private CacheInfo _featureCacheStaleness; // 特征缓存过期检测结果（null=未检查/无缓存）
 
         // ===== 结果 UI =====
-        private Vector2 _scrollPos;
-        private Dictionary<int, Vector2> _thumbScrolls = new Dictionary<int, Vector2>();
-        private Dictionary<int, HashSet<int>> _selectedForDeletion = new Dictionary<int, HashSet<int>>();
-        private Dictionary<string, Texture2D> _thumbnailCache = new Dictionary<string, Texture2D>();
-        private const int THUMB_SIZE = 64;
+        private Vector2 _scanScrollPos;
+        private Vector2 _queryScrollPos;
+        private GUIStyle _queryRankStyle;
+        private Vector2 _pendingScrollPos;
+        private bool _hasPendingScrollPos;
+        private float _resultsViewportHeight;
+        private float _pendingResultsViewportHeight;
+        private readonly Dictionary<int, Vector2> _thumbScrolls = new Dictionary<int, Vector2>();
+        private readonly Dictionary<int, Vector2> _pendingThumbScrolls = new Dictionary<int, Vector2>();
+        private readonly Dictionary<int, float> _groupHeights = new Dictionary<int, float>();
+        private readonly Dictionary<int, float> _pendingGroupHeights = new Dictionary<int, float>();
+        private readonly Dictionary<int, HashSet<int>> _selectedForDeletion = new Dictionary<int, HashSet<int>>();
+        private readonly Dictionary<string, Texture2D> _thumbnailCache = new Dictionary<string, Texture2D>();
+        private string _groupKeywordInput = string.Empty;
+        private string _appliedGroupKeyword = string.Empty;
+        private List<DuplicateGroup> _filteredGroups;
+        private const int ThumbnailSize = 64;
+        private const float ThumbnailListHeight = ThumbnailSize + 40f;
+        private const float GroupSpacing = 8f;
 
         // ===== 依赖安装 =====
         private DependencyInstaller _installer;
@@ -59,6 +80,7 @@ namespace ImageSimilarityPlugin
         private string _queryImagePath = "";      // 查询图片的绝对路径
         private int _topK = 50;                   // 最大返回结果数
         private int _queryPickerControlID;         // ObjectPicker 控件 ID
+        private bool _showExcludedDirectories = true;
 
         // ===== 查询结果 =====
         private QueryResultData _queryResults;    // 查询结果
@@ -82,27 +104,51 @@ namespace ImageSimilarityPlugin
             _installer = new DependencyInstaller();
             _installer.OnCompleted += (success, msg) =>
             {
-                if (success) _depsInstalled = true;
+                if (success)
+                {
+                    // pip 成功后用当前 Python 快速复检一次，避免窗口状态和实际解释器环境不一致。
+                    _depsInstalled = PythonLocator.AreDependenciesInstalled();
+                    PythonLocator.MarkDependenciesChecked();
+                    if (!_depsInstalled)
+                        msg = "依赖安装命令已完成，但当前 Python 仍检测不到所需模块，请检查顶部配置的 Python 路径。";
+                }
+                else
+                {
+                    _depsInstalled = false;
+                }
+
                 _statusMessage = msg;
-                _statusIsError = !success;
+                _statusIsError = !success || !_depsInstalled;
+                if (_depsInstalled)
+                    EnsurePythonSessionStarted();
                 Repaint();
             };
 
-            // 默认扫描整个 Assets 目录
-            if (string.IsNullOrEmpty(_folderPath))
-                _folderPath = Application.dataPath;
+            // 新建窗口恢复当前项目上次使用的目录；已序列化的有效窗口状态优先保留。
+            if (string.IsNullOrEmpty(_folderPath) || !Directory.Exists(_folderPath))
+                _folderPath = SearchDirectorySettings.GetDirectory();
 
-            // 提前启动持久化 Python 会话，后台加载 TF 模型
-            if (PythonLocator.GetPythonPath() != null)
-                _ = PythonSession.Instance;
-
+            EditorApplication.update += RepaintWhileFR2Pending;
             CheckEnvironment();
         }
 
         private void OnDisable()
         {
+            EditorApplication.update -= RepaintWhileFR2Pending;
             _runner?.Cancel();
+            _installer?.Close();
+            SearchDirectorySettings.Save(_folderPath);
             ClearThumbnailCache();
+        }
+
+        private void RepaintWhileFR2Pending()
+        {
+            if (EditorApplication.timeSinceStartup < _nextFr2RepaintTime) return;
+            _nextFr2RepaintTime = EditorApplication.timeSinceStartup + 0.5d;
+
+            var status = FR2Integration.GetStatus();
+            if (status.Installed && !status.Ready)
+                Repaint();
         }
 
         /// <summary>
@@ -123,6 +169,8 @@ namespace ImageSimilarityPlugin
                     _depsInstalled = PythonLocator.AreDependenciesInstalled();
                     _checkingDeps = false;
                     PythonLocator.MarkDependenciesChecked();
+                    if (_depsInstalled)
+                        EnsurePythonSessionStarted();
                     Repaint();
                 };
             }
@@ -131,8 +179,21 @@ namespace ImageSimilarityPlugin
                 _depsInstalled = PythonLocator.AreDependenciesInstalled();
             }
 
-            _fr2Ready = FR2Integration.IsReady;
             CheckCache();
+            if (_depsInstalled)
+                EnsurePythonSessionStarted();
+        }
+
+        /// <summary>
+        /// 仅在依赖确认可用后启动 TensorFlow 服务，避免缺包时反复拉起失败进程。
+        /// </summary>
+        private void EnsurePythonSessionStarted()
+        {
+            if (!_depsInstalled || PythonLocator.GetPythonPath() == null) return;
+
+            _ = PythonSession.Instance;
+            _lastFeatureCheckFolder = null;
+            TriggerFeatureCacheCheck();
         }
 
         // ==================================================================
@@ -231,12 +292,10 @@ namespace ImageSimilarityPlugin
                 GUILayout.Width(180));
 
             // FR2 状态
-            bool fr2Installed = FR2Integration.HasFR2();
-            GUI.color = _fr2Ready ? Color.green : (fr2Installed ? Color.yellow : Color.red);
-            EditorGUILayout.LabelField(
-                _fr2Ready ? " FR2 已就绪" :
-                fr2Installed ? " FR2 缓存为空" : " FR2 未安装",
-                GUILayout.Width(160));
+            var fr2Status = FR2Integration.GetStatus();
+            GUI.color = fr2Status.Ready ? Color.green : (fr2Status.Installed ? Color.yellow : Color.red);
+            EditorGUILayout.LabelField(new GUIContent(fr2Status.Label, fr2Status.Tooltip),
+                GUILayout.Width(180));
 
             GUI.color = Color.white;
             GUILayout.FlexibleSpace();
@@ -277,7 +336,7 @@ namespace ImageSimilarityPlugin
         /// </summary>
         private void DrawInstallLog()
         {
-            if (!_installer.IsInstalling) return;
+            if (!_installer.IsPanelVisible) return;
 
             EditorGUILayout.Space(3);
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
@@ -285,11 +344,7 @@ namespace ImageSimilarityPlugin
             EditorGUILayout.BeginHorizontal();
             EditorGUILayout.LabelField("安装日志", EditorStyles.boldLabel);
             GUILayout.FlexibleSpace();
-            if (_installer.Progress >= 1f || string.IsNullOrEmpty(_installer.Log))
-            {
-                // 已完成或出错时可关闭
-            }
-            if (_installer.Progress >= 1f || _installer.Log.StartsWith("错误"))
+            if (!_installer.IsInstalling)
             {
                 if (GUILayout.Button("关闭", EditorStyles.miniButton, GUILayout.Width(40)))
                 {
@@ -350,14 +405,16 @@ namespace ImageSimilarityPlugin
             // 文件夹选择
             EditorGUILayout.BeginHorizontal();
             EditorGUILayout.LabelField("文件夹:", GUILayout.Width(60));
-            _folderPath = EditorGUILayout.TextField(_folderPath);
+            SetFolderPath(DrawEditablePathField(_folderPath));
             if (GUILayout.Button("浏览", GUILayout.Width(70)))
             {
                 string selected = EditorUtility.OpenFolderPanel("选择要扫描的文件夹", _folderPath, "");
                 if (!string.IsNullOrEmpty(selected))
-                    _folderPath = selected;
+                    SetFolderPath(selected);
             }
             EditorGUILayout.EndHorizontal();
+
+            DrawExcludedDirectories();
 
             // 相似度阈值滑块（0~1）
             EditorGUILayout.BeginHorizontal();
@@ -385,14 +442,13 @@ namespace ImageSimilarityPlugin
         {
             EditorGUILayout.BeginHorizontal();
 
-            bool canScan = !string.IsNullOrEmpty(_pythonVersion) && _depsInstalled && !_runner.IsRunning;
-
-            GUI.enabled = canScan;
+            bool previousEnabled = GUI.enabled;
+            GUI.enabled = previousEnabled && CanStartRunner;
             if (GUILayout.Button("开始扫描", GUILayout.Height(30), GUILayout.Width(120)))
             {
                 StartScan();
             }
-            GUI.enabled = true;
+            GUI.enabled = previousEnabled;
 
             if (_runner.IsRunning)
             {
@@ -417,13 +473,7 @@ namespace ImageSimilarityPlugin
                 EditorGUI.ProgressBar(r, _runner.Progress, $"正在扫描... {(_runner.Progress * 100f):F0}%");
             }
 
-            // 状态消息
-            if (!string.IsNullOrEmpty(_statusMessage))
-            {
-                GUI.color = _statusIsError ? Color.red : Color.white;
-                EditorGUILayout.LabelField(_statusMessage, EditorStyles.wordWrappedLabel);
-                GUI.color = Color.white;
-            }
+            DrawStatusMessage();
 
             // 缓存可用提示（无缓存结果时显示加载按钮）
             if (_hasCache && _results == null && !_runner.IsRunning)
@@ -449,7 +499,8 @@ namespace ImageSimilarityPlugin
                 if (GUILayout.Button(fromCache ? "这些是缓存数据，点击重新扫描" : "清除缓存", EditorStyles.miniLabel))
                 {
                     DeleteCache();
-                    _results = null;
+                    ClearScanResults();
+                    ClearThumbnailCache();
                     _statusMessage = "缓存已清除，可以重新扫描。";
                     Repaint();
                 }
@@ -477,18 +528,135 @@ namespace ImageSimilarityPlugin
 
             // 缓存更新信息
             DrawCacheInfo(_results.cache_info);
+            DrawGroupKeywordFilter();
 
             EditorGUILayout.Space(5);
 
-            _scrollPos = EditorGUILayout.BeginScrollView(_scrollPos);
-
-            for (int gi = 0; gi < _results.groups.Count; gi++)
+            List<DuplicateGroup> displayedGroups = _filteredGroups ?? _results.groups;
+            if (displayedGroups.Count == 0)
             {
-                DrawGroupCard(_results.groups[gi]);
-                EditorGUILayout.Space(8);
+                EditorGUILayout.LabelField(
+                    $"没有图片名称包含“{_appliedGroupKeyword}”的分组。",
+                    EditorStyles.wordWrappedLabel);
+                return;
+            }
+
+            ApplyPendingVirtualizationState();
+
+            Vector2 currentScroll = _scanScrollPos;
+            Vector2 updatedScroll = EditorGUILayout.BeginScrollView(currentScroll);
+
+            if (Event.current.type == EventType.Repaint)
+            {
+                Rect viewportRect = GUILayoutUtility.GetLastRect();
+                if (viewportRect.height > 1f)
+                    _pendingResultsViewportHeight = viewportRect.height;
+            }
+
+            float viewportHeight = _resultsViewportHeight > 1f
+                ? _resultsViewportHeight
+                : Mathf.Max(1f, position.height);
+            float visibleTop = Mathf.Max(0f, currentScroll.y);
+            float visibleBottom = visibleTop + viewportHeight;
+            float groupTop = 0f;
+
+            for (int gi = 0; gi < displayedGroups.Count; gi++)
+            {
+                DuplicateGroup group = displayedGroups[gi];
+                float reservedHeight = GetGroupHeight(group);
+                bool shouldDraw = groupTop + reservedHeight > visibleTop
+                    && groupTop < visibleBottom;
+
+                if (shouldDraw)
+                {
+                    float actualHeight = DrawGroupCard(group);
+                    if (Event.current.type == EventType.Repaint && actualHeight > 0f)
+                        _pendingGroupHeights[group.id] = actualHeight;
+                }
+                else
+                {
+                    // 只保留布局高度，不执行组内缩略图、路径控件和 FR2 查询。
+                    GUILayout.Space(reservedHeight);
+                }
+
+                EditorGUILayout.Space(GroupSpacing);
+                groupTop += reservedHeight + GroupSpacing;
             }
 
             EditorGUILayout.EndScrollView();
+
+            if (updatedScroll != currentScroll)
+            {
+                // 滚动位置延迟到下一次 Layout 应用，确保同一事件的控件集合保持一致。
+                _pendingScrollPos = updatedScroll;
+                _hasPendingScrollPos = true;
+                Repaint();
+            }
+        }
+
+        /// <summary>绘制显式应用的图片名称关键词筛选工具栏。</summary>
+        private void DrawGroupKeywordFilter()
+        {
+            EditorGUILayout.BeginHorizontal(EditorStyles.toolbar);
+            EditorGUILayout.LabelField("图片名称:", GUILayout.Width(64));
+            _groupKeywordInput = EditorGUILayout.TextField(
+                _groupKeywordInput,
+                EditorStyles.toolbarTextField);
+
+            if (GUILayout.Button("搜索", EditorStyles.toolbarButton, GUILayout.Width(52)))
+                ApplyGroupKeywordFilter(_groupKeywordInput);
+
+            bool previousEnabled = GUI.enabled;
+            GUI.enabled = previousEnabled && !string.IsNullOrEmpty(_appliedGroupKeyword);
+            if (GUILayout.Button("清除", EditorStyles.toolbarButton, GUILayout.Width(52)))
+            {
+                _groupKeywordInput = string.Empty;
+                ApplyGroupKeywordFilter(string.Empty);
+            }
+            GUI.enabled = previousEnabled;
+            EditorGUILayout.EndHorizontal();
+
+            if (!string.IsNullOrEmpty(_appliedGroupKeyword))
+            {
+                int displayedCount = _filteredGroups?.Count ?? 0;
+                EditorGUILayout.LabelField(
+                    $"关键词“{_appliedGroupKeyword}”：显示 {displayedCount} / {_results.groups.Count} 组",
+                    EditorStyles.miniLabel);
+            }
+        }
+
+        private void ApplyGroupKeywordFilter(string keyword)
+        {
+            _appliedGroupKeyword = (keyword ?? string.Empty).Trim();
+            RebuildGroupKeywordFilter();
+            ResetScanResultViewState();
+            Repaint();
+        }
+
+        /// <summary>仅在筛选提交或结果变化时重建，避免 OnGUI 每帧扫描所有文件名。</summary>
+        private void RebuildGroupKeywordFilter()
+        {
+            if (_results?.groups == null || string.IsNullOrEmpty(_appliedGroupKeyword))
+            {
+                _filteredGroups = null;
+                return;
+            }
+
+            var matches = new List<DuplicateGroup>();
+            foreach (DuplicateGroup group in _results.groups)
+            {
+                if (group?.images == null) continue;
+                foreach (string imagePath in group.images)
+                {
+                    if (string.IsNullOrEmpty(imagePath)) continue;
+                    string fileName = Path.GetFileName(imagePath);
+                    if (fileName.IndexOf(_appliedGroupKeyword, StringComparison.OrdinalIgnoreCase) < 0)
+                        continue;
+                    matches.Add(group);
+                    break;
+                }
+            }
+            _filteredGroups = matches;
         }
 
         /// <summary>
@@ -496,9 +664,9 @@ namespace ImageSimilarityPlugin
         /// 包含：组头、水平滚动缩略图行（支持选择 + FR2 角标）、
         /// 路径列表、"定位"按钮、自动选择重复项、删除选中资产。
         /// </summary>
-        private void DrawGroupCard(DuplicateGroup group)
+        private float DrawGroupCard(DuplicateGroup group)
         {
-            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            Rect groupRect = EditorGUILayout.BeginVertical(EditorStyles.helpBox);
 
             // 组头
             EditorGUILayout.BeginHorizontal();
@@ -514,52 +682,56 @@ namespace ImageSimilarityPlugin
             EditorGUILayout.EndHorizontal();
 
             // 缩略图行 — 水平滚动，支持任意数量图片
-            float thumbSlotWidth = THUMB_SIZE + 12;
+            float thumbSlotWidth = ThumbnailSize + 12;
             float rowWidth = group.images.Count * thumbSlotWidth + 4;
 
             if (!_thumbScrolls.ContainsKey(group.id))
                 _thumbScrolls[group.id] = Vector2.zero;
             var scroll = _thumbScrolls[group.id];
-            _thumbScrolls[group.id] = EditorGUILayout.BeginScrollView(
-                scroll, false, true, GUILayout.Height(THUMB_SIZE + 40));
+            scroll.y = 0f;
+            Vector2 updatedScroll = GUILayout.BeginScrollView(
+                scroll,
+                true,
+                false,
+                GUI.skin.horizontalScrollbar,
+                GUIStyle.none,
+                GUILayout.Height(ThumbnailListHeight));
+            updatedScroll.y = 0f;
             EditorGUILayout.BeginHorizontal(GUILayout.Width(rowWidth));
 
-            for (int i = 0; i < group.images.Count; i++)
+            float thumbnailViewportWidth = Mathf.Max(ThumbnailSize, position.width - 40f);
+            int firstVisibleIndex = Mathf.Max(0, Mathf.FloorToInt(scroll.x / thumbSlotWidth));
+            int lastVisibleIndex = Mathf.Clamp(
+                Mathf.CeilToInt((scroll.x + thumbnailViewportWidth) / thumbSlotWidth),
+                firstVisibleIndex,
+                group.images.Count);
+
+            if (firstVisibleIndex > 0)
+                GUILayout.Space(firstVisibleIndex * thumbSlotWidth);
+
+            for (int i = firstVisibleIndex; i < lastVisibleIndex; i++)
             {
                 bool isSelected = IsSelected(group.id, i);
 
-                EditorGUILayout.BeginVertical(GUILayout.Width(THUMB_SIZE + 8));
+                EditorGUILayout.BeginVertical(GUILayout.Width(ThumbnailSize + 8));
 
                 // 选择框 + 文件名
                 EditorGUILayout.BeginHorizontal();
                 bool newSelected = EditorGUILayout.Toggle(isSelected, GUILayout.Width(16));
                 if (newSelected != isSelected)
                     ToggleSelection(group.id, i);
-                EditorGUILayout.LabelField(Path.GetFileName(group.images[i]), GUILayout.Width(THUMB_SIZE - 8));
+                string fileName = Path.GetFileName(group.images[i]);
+                string displayPath = PluginUtils.ToDisplayPath(group.images[i]);
+                EditorGUILayout.LabelField(
+                    new GUIContent(fileName, displayPath),
+                    GUILayout.Width(ThumbnailSize - 8));
                 EditorGUILayout.EndHorizontal();
 
                 // 缩略图（保宽高比）
                 Texture2D thumb = GetThumbnail(group.images[i]);
-                Rect thumbRect = GUILayoutUtility.GetRect(THUMB_SIZE, THUMB_SIZE,
-                    GUILayout.Width(THUMB_SIZE), GUILayout.Height(THUMB_SIZE));
-                EditorGUI.DrawRect(thumbRect, new Color(0.2f, 0.2f, 0.2f, 0.5f));
-
-                if (thumb != null)
-                {
-                    float texAspect = (float)thumb.width / Mathf.Max(1, thumb.height);
-                    float drawW, drawH;
-                    if (texAspect >= 1f) { drawW = THUMB_SIZE; drawH = THUMB_SIZE / texAspect; }
-                    else { drawH = THUMB_SIZE; drawW = THUMB_SIZE * texAspect; }
-                    Rect drawRect = new Rect(
-                        thumbRect.x + (THUMB_SIZE - drawW) / 2f,
-                        thumbRect.y + (THUMB_SIZE - drawH) / 2f,
-                        drawW, drawH);
-                    GUI.DrawTexture(drawRect, thumb, ScaleMode.StretchToFill);
-                }
-                else
-                {
-                    GUI.Label(thumbRect, "?", EditorStyles.centeredGreyMiniLabel);
-                }
+                Rect thumbRect = GUILayoutUtility.GetRect(ThumbnailSize, ThumbnailSize,
+                    GUILayout.Width(ThumbnailSize), GUILayout.Height(ThumbnailSize));
+                DrawThumbnail(thumbRect, thumb);
 
                 // 点击缩略图 → 打开大图预览窗口
                 if (GUI.Button(thumbRect, GUIContent.none, GUIStyle.none))
@@ -573,15 +745,26 @@ namespace ImageSimilarityPlugin
                 EditorGUILayout.EndVertical();
                 GUILayout.Space(4);
             }
+
+            int trailingCount = group.images.Count - lastVisibleIndex;
+            if (trailingCount > 0)
+                GUILayout.Space(trailingCount * thumbSlotWidth);
+
             EditorGUILayout.EndHorizontal();
-            EditorGUILayout.EndScrollView();
+            GUILayout.EndScrollView();
+
+            if (updatedScroll != scroll)
+                _pendingThumbScrolls[group.id] = updatedScroll;
 
             // 路径列表（每张图可定位）
             EditorGUILayout.LabelField("路径:", EditorStyles.miniLabel);
             foreach (var img in group.images)
             {
+                string displayPath = PluginUtils.ToDisplayPath(img);
                 EditorGUILayout.BeginHorizontal();
-                EditorGUILayout.LabelField("  " + img, EditorStyles.miniLabel);
+                EditorGUILayout.LabelField(
+                    new GUIContent("  " + displayPath, displayPath),
+                    EditorStyles.miniLabel);
                 if (GUILayout.Button("定位", EditorStyles.miniButton, GUILayout.Width(40)))
                 {
                     PluginUtils.PingAsset(img);
@@ -592,15 +775,101 @@ namespace ImageSimilarityPlugin
             // 删除选中资产按钮
             EditorGUILayout.BeginHorizontal();
             int selectedCount = GetSelectedCount(group.id);
-            GUI.enabled = selectedCount > 0 && IsInProjectAssets(group);
+            bool previousEnabled = GUI.enabled;
+            GUI.enabled = previousEnabled && selectedCount > 0 && IsInProjectAssets(group);
             if (GUILayout.Button($"删除 {selectedCount} 个选中资产", GUILayout.Height(25)))
             {
                 DeleteSelected(group);
             }
-            GUI.enabled = true;
+            GUI.enabled = previousEnabled;
             EditorGUILayout.EndHorizontal();
 
             EditorGUILayout.EndVertical();
+            return groupRect.height;
+        }
+
+        /// <summary>
+        /// 在 Layout 事件统一应用上一帧测得的高度和滚动位置，保证 Layout/Repaint 使用同一批控件。
+        /// </summary>
+        private void ApplyPendingVirtualizationState()
+        {
+            if (Event.current.type != EventType.Layout) return;
+
+            if (_hasPendingScrollPos)
+            {
+                _scanScrollPos = _pendingScrollPos;
+                _hasPendingScrollPos = false;
+            }
+
+            if (_pendingResultsViewportHeight > 1f)
+            {
+                _resultsViewportHeight = _pendingResultsViewportHeight;
+                _pendingResultsViewportHeight = 0f;
+            }
+
+            foreach (var pair in _pendingGroupHeights)
+                _groupHeights[pair.Key] = pair.Value;
+            _pendingGroupHeights.Clear();
+
+            foreach (var pair in _pendingThumbScrolls)
+                _thumbScrolls[pair.Key] = pair.Value;
+            _pendingThumbScrolls.Clear();
+        }
+
+        /// <summary>
+        /// 未实际绘制过的组按当前控件结构估算高度；进入可见区后会用真实高度替换。
+        /// </summary>
+        private float GetGroupHeight(DuplicateGroup group)
+        {
+            if (_groupHeights.TryGetValue(group.id, out float measuredHeight))
+                return measuredHeight;
+
+            int imageCount = group.images?.Count ?? 0;
+            float lineHeight = EditorGUIUtility.singleLineHeight;
+            float spacing = EditorGUIUtility.standardVerticalSpacing;
+            float padding = EditorStyles.helpBox.padding.vertical;
+
+            // 组头 + 缩略图滚动区 + 路径标题 + 路径行 + 删除按钮。
+            return lineHeight * 2f
+                + ThumbnailListHeight
+                + 25f
+                + padding
+                + spacing * (imageCount + 3)
+                + lineHeight * imageCount;
+        }
+
+        /// <summary>
+        /// 切换结果集时清除只对旧分组有效的测量值和滚动位置。
+        /// 分组本身始终保持完整展开，虚拟化只决定是否创建整组控件。
+        /// </summary>
+        private void ResetScanResultViewState()
+        {
+            _scanScrollPos = Vector2.zero;
+            _pendingScrollPos = Vector2.zero;
+            _hasPendingScrollPos = false;
+            _resultsViewportHeight = 0f;
+            _pendingResultsViewportHeight = 0f;
+            _thumbScrolls.Clear();
+            _pendingThumbScrolls.Clear();
+            _groupHeights.Clear();
+            _pendingGroupHeights.Clear();
+        }
+
+        /// <summary>清除分组结果及只对当前结果有效的 UI 状态。</summary>
+        private void ClearScanResults()
+        {
+            _results = null;
+            _filteredGroups = null;
+            _selectedForDeletion.Clear();
+            ResetScanResultViewState();
+        }
+
+        /// <summary>清除分组扫描和以图搜图两种模式的结果状态。</summary>
+        private void ClearAllResults()
+        {
+            ClearScanResults();
+            _queryResults = null;
+            _queryScrollPos = Vector2.zero;
         }
 
         // ==================================================================
@@ -615,13 +884,12 @@ namespace ImageSimilarityPlugin
         {
             if (!Directory.Exists(_folderPath))
             {
-                _statusMessage = $"文件夹不存在: {_folderPath}";
+                _statusMessage = $"文件夹不存在: {PluginUtils.ToDisplayPath(_folderPath)}";
                 _statusIsError = true;
                 return;
             }
 
-            _results = null;
-            _selectedForDeletion.Clear();
+            ClearScanResults();
             ClearThumbnailCache();
             _statusMessage = "";
             _statusIsError = false;
@@ -633,10 +901,15 @@ namespace ImageSimilarityPlugin
                 recursive: _recursive,
                 workers: _workers,
                 cacheFeaturesDir: Path.Combine(CacheDir, "features"),
+                excludedDirectories: ExcludedDirectorySettings.GetDirectories(),
                 onComplete: result =>
                 {
+                    RefreshReferenceCounts(result);
                     _results = result;
-                    _statusMessage = $"扫描完成：找到 {result.total_groups} 组相似图片。";
+                    RebuildGroupKeywordFilter();
+                    int failedCount = result.failed_images?.Count ?? 0;
+                    _statusMessage = $"扫描完成：找到 {result.total_groups} 组相似图片。" +
+                                     (failedCount > 0 ? $" 跳过 {failedCount} 张处理失败的图片。" : string.Empty);
                     _statusIsError = false;
                     SaveCache(result);
                     _featureCacheStaleness = null; // 扫描后缓存已最新，清除警告
@@ -695,18 +968,11 @@ namespace ImageSimilarityPlugin
 
         /// <summary>
         /// 删除组内选中的图片资产。
-        /// 仅支持项目 Assets 目录内的文件（通过 AssetDatabase.DeleteAsset），
-        /// 外部文件需手动删除。操作可撤销（Ctrl+Z）。
+        /// 仅支持项目 Assets 目录内的文件，成功项会移入系统回收站/废纸篓。
+        /// Unity 的 Ctrl+Z 不能撤销文件删除，外部文件需手动处理。
         /// </summary>
         private void DeleteSelected(DuplicateGroup group)
         {
-            if (!IsInProjectAssets(group))
-            {
-                EditorUtility.DisplayDialog("无法删除",
-                    "部分图片不在项目 Assets 文件夹内，请通过文件管理器手动删除。", "确定");
-                return;
-            }
-
             var toDelete = new List<string>();
             for (int i = 0; i < group.images.Count; i++)
             {
@@ -715,34 +981,42 @@ namespace ImageSimilarityPlugin
             }
 
             if (toDelete.Count == 0) return;
+            if (toDelete.Exists(path => string.IsNullOrEmpty(PluginUtils.AbsoluteToAssetPath(path))))
+            {
+                EditorUtility.DisplayDialog("无法删除",
+                    "选中项包含 Assets 目录外的文件，请通过文件管理器手动处理。", "确定");
+                return;
+            }
 
-            string msg = $"确认删除 {toDelete.Count} 张图片？\n\n文件将移至回收站，可通过 Ctrl+Z 撤销此操作。";
+            string msg = $"确认删除 {toDelete.Count} 张图片？\n\n" +
+                         "文件将移至系统回收站/废纸篓；Unity 不支持 Ctrl+Z 撤销此操作。";
             if (!EditorUtility.DisplayDialog("确认删除", msg, "删除", "取消"))
                 return;
 
-            // 批量删除以减少资源刷新次数
-            AssetDatabase.StartAssetEditing();
-            try
+            var deleted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var path in toDelete)
             {
-                foreach (var path in toDelete)
+                string assetPath = PluginUtils.AbsoluteToAssetPath(path);
+                if (!string.IsNullOrEmpty(assetPath) && AssetDatabase.MoveAssetToTrash(assetPath))
                 {
-                    string assetPath = PluginUtils.AbsoluteToAssetPath(path);
-                    if (!string.IsNullOrEmpty(assetPath))
-                    {
-                        AssetDatabase.DeleteAsset(assetPath);
-                    }
+                    deleted.Add(path);
+                }
+                else
+                {
+                    Debug.LogError($"[ImageSimilarityPlugin] 删除资产失败: {assetPath}");
                 }
             }
-            finally
-            {
-                AssetDatabase.StopAssetEditing();
-                AssetDatabase.Refresh();
-            }
+            AssetDatabase.Refresh();
 
-            group.images.RemoveAll(img => toDelete.Contains(img));
+            group.images.RemoveAll(img => deleted.Contains(img));
+            // 删除命中图片后立即重建筛选，避免空组继续占用旧的虚拟化布局。
+            RebuildGroupKeywordFilter();
             ClearSelection(group.id);
-            _statusMessage = $"已删除 {toDelete.Count} 个资产。";
-            _statusIsError = false;
+            ResetScanResultViewState();
+            _statusMessage = deleted.Count == toDelete.Count
+                ? $"已将 {deleted.Count} 个资产移至系统回收站/废纸篓。"
+                : $"删除完成：成功 {deleted.Count} 个，失败 {toDelete.Count - deleted.Count} 个。";
+            _statusIsError = deleted.Count != toDelete.Count;
             Repaint();
         }
 
@@ -759,17 +1033,17 @@ namespace ImageSimilarityPlugin
             _statusMessage = "";
             _statusIsError = false;
             string pythonPath = PythonLocator.GetPythonPath();
-            string reqPath = Path.Combine(PythonRunner.GetPythonScriptsDir(), "requirements.txt");
+            string scriptsDir = PythonRunner.GetPythonScriptsDir();
+            if (string.IsNullOrEmpty(scriptsDir))
+            {
+                _statusMessage = "无法定位插件 Python 目录，请保持 ImageSimilarityPlugin 内部结构为 Editor/Python 同级。";
+                _statusIsError = true;
+                return;
+            }
+
+            string reqPath = Path.Combine(scriptsDir, "requirements.txt");
             _installer.StartInstall(pythonPath, reqPath);
             Repaint();
-        }
-
-        /// <summary>
-        /// 关闭安装日志面板。
-        /// </summary>
-        private void CloseInstallLog()
-        {
-            _installer.Close();
         }
 
         // ==================================================================
@@ -783,8 +1057,13 @@ namespace ImageSimilarityPlugin
         /// </summary>
         private void CheckCache()
         {
-            if (_folderPath == _lastCheckedFolder) return;
+            string exclusionScope = ExcludedDirectorySettings.GetScopeKey();
+            if (_folderPath == _lastCheckedFolder
+                && _recursive == _lastCheckedRecursive
+                && exclusionScope == _lastCheckedExclusionScope) return;
             _lastCheckedFolder = _folderPath;
+            _lastCheckedRecursive = _recursive;
+            _lastCheckedExclusionScope = exclusionScope;
 
             // --- 扫描结果缓存 ---
             _cachePath = GetCacheFilePath();
@@ -794,7 +1073,10 @@ namespace ImageSimilarityPlugin
                 {
                     string json = File.ReadAllText(_cachePath, Encoding.UTF8);
                     var meta = JsonUtility.FromJson<CacheMeta>(json);
-                    if (meta != null && meta.folder == _folderPath)
+                    if (meta != null && meta.recursive == _recursive
+                        && PluginUtils.PathsEqual(meta.folder, _folderPath)
+                        && meta.exclusion_scope == exclusionScope
+                        && File.Exists(GetResultCacheFilePath()))
                     {
                         _hasCache = true;
                         _cacheInfo = $"{meta.total_groups} 组 | 阈值: {meta.threshold:F2} | {meta.date}";
@@ -820,14 +1102,20 @@ namespace ImageSimilarityPlugin
             if (!PythonSession.Instance.IsReady) return;
             // Session is now ready — retry the check
             _lastFeatureCheckFolder = null; // allow Trigger to proceed
+            _lastFeatureCheckExclusionScope = null;
             TriggerFeatureCacheCheck();
         }
 
         private void TriggerFeatureCacheCheck()
         {
-            if (string.IsNullOrEmpty(_folderPath)) return;
-            if (_folderPath == _lastFeatureCheckFolder) return;
+            if (!_depsInstalled || string.IsNullOrEmpty(_folderPath)) return;
+            string exclusionScope = ExcludedDirectorySettings.GetScopeKey();
+            if (_folderPath == _lastFeatureCheckFolder
+                && _recursive == _lastFeatureCheckRecursive
+                && exclusionScope == _lastFeatureCheckExclusionScope) return;
             _lastFeatureCheckFolder = _folderPath;
+            _lastFeatureCheckRecursive = _recursive;
+            _lastFeatureCheckExclusionScope = exclusionScope;
 
             if (!PythonSession.Instance.IsReady)
             {
@@ -839,6 +1127,7 @@ namespace ImageSimilarityPlugin
             string featuresDir = Path.Combine(CacheDir, "features");
             PythonSession.Instance.CheckCache(
                 _folderPath, featuresDir, _recursive,
+                ExcludedDirectorySettings.GetDirectories(),
                 onResult: info =>
                 {
                     _featureCacheStaleness = info;
@@ -863,13 +1152,15 @@ namespace ImageSimilarityPlugin
                 {
                     folder = _folderPath,
                     threshold = _threshold,
+                    recursive = _recursive,
+                    exclusion_scope = ExcludedDirectorySettings.GetScopeKey(),
                     total_images = result.total_images,
                     total_groups = result.total_groups,
                     date = DateTime.Now.ToString("yyyy-MM-dd HH:mm"),
                 }, true);
                 File.WriteAllText(_cachePath, meta, Encoding.UTF8);
 
-                string resultPath = _cachePath.Replace(".json", "_result.json");
+                string resultPath = GetResultCacheFilePath();
                 string resultJson = JsonUtility.ToJson(result, true);
                 File.WriteAllText(resultPath, resultJson, Encoding.UTF8);
 
@@ -888,7 +1179,7 @@ namespace ImageSimilarityPlugin
         /// </summary>
         private void LoadCache()
         {
-            string resultPath = _cachePath.Replace(".json", "_result.json");
+            string resultPath = GetResultCacheFilePath();
             if (!File.Exists(resultPath)) return;
 
             try
@@ -897,7 +1188,10 @@ namespace ImageSimilarityPlugin
                 _results = JsonUtility.FromJson<ScanResultData>(json);
                 if (_results != null)
                 {
+                    RefreshReferenceCounts(_results);
+                    RebuildGroupKeywordFilter();
                     _selectedForDeletion.Clear();
+                    ResetScanResultViewState();
                     ClearThumbnailCache();
                     _statusMessage = $"已从缓存加载 — {_cacheInfo}";
                     _statusIsError = false;
@@ -919,7 +1213,7 @@ namespace ImageSimilarityPlugin
             try
             {
                 if (File.Exists(_cachePath)) File.Delete(_cachePath);
-                string resultPath = _cachePath?.Replace(".json", "_result.json");
+                string resultPath = GetResultCacheFilePath();
                 if (resultPath != null && File.Exists(resultPath)) File.Delete(resultPath);
             }
             catch { }
@@ -977,14 +1271,16 @@ namespace ImageSimilarityPlugin
             // 目标文件夹
             EditorGUILayout.BeginHorizontal();
             EditorGUILayout.LabelField("目标文件夹:", GUILayout.Width(80));
-            _folderPath = EditorGUILayout.TextField(_folderPath);
+            SetFolderPath(DrawEditablePathField(_folderPath));
             if (GUILayout.Button("浏览", GUILayout.Width(70)))
             {
                 string selected = EditorUtility.OpenFolderPanel("选择目标文件夹", _folderPath, "");
                 if (!string.IsNullOrEmpty(selected))
-                    _folderPath = selected;
+                    SetFolderPath(selected);
             }
             EditorGUILayout.EndHorizontal();
+
+            DrawExcludedDirectories();
 
             // 相似度阈值 + Top-K
             EditorGUILayout.BeginHorizontal();
@@ -1009,17 +1305,17 @@ namespace ImageSimilarityPlugin
         {
             EditorGUILayout.BeginHorizontal();
 
-            bool canQuery = !string.IsNullOrEmpty(_pythonVersion) && _depsInstalled
-                && !_runner.IsRunning
+            bool canQuery = CanStartRunner
                 && !string.IsNullOrEmpty(_queryImagePath)
                 && File.Exists(_queryImagePath);
 
-            GUI.enabled = canQuery;
+            bool previousEnabled = GUI.enabled;
+            GUI.enabled = previousEnabled && canQuery;
             if (GUILayout.Button("开始搜索", GUILayout.Height(30), GUILayout.Width(120)))
             {
                 StartQuery();
             }
-            GUI.enabled = true;
+            GUI.enabled = previousEnabled;
 
             if (_runner.IsRunning)
             {
@@ -1044,13 +1340,7 @@ namespace ImageSimilarityPlugin
                 EditorGUI.ProgressBar(r, _runner.Progress, $"正在搜索... {(_runner.Progress * 100f):F0}%");
             }
 
-            // 状态消息
-            if (!string.IsNullOrEmpty(_statusMessage))
-            {
-                GUI.color = _statusIsError ? Color.red : Color.white;
-                EditorGUILayout.LabelField(_statusMessage, EditorStyles.wordWrappedLabel);
-                GUI.color = Color.white;
-            }
+            DrawStatusMessage();
         }
 
         /// <summary>
@@ -1061,19 +1351,18 @@ namespace ImageSimilarityPlugin
         {
             if (!File.Exists(_queryImagePath))
             {
-                _statusMessage = $"查询图片不存在: {_queryImagePath}";
+                _statusMessage = $"查询图片不存在: {PluginUtils.ToDisplayPath(_queryImagePath)}";
                 _statusIsError = true;
                 return;
             }
             if (!Directory.Exists(_folderPath))
             {
-                _statusMessage = $"目标文件夹不存在: {_folderPath}";
+                _statusMessage = $"目标文件夹不存在: {PluginUtils.ToDisplayPath(_folderPath)}";
                 _statusIsError = true;
                 return;
             }
 
-            _results = null;
-            _queryResults = null;
+            ClearAllResults();
             ClearThumbnailCache();
             _statusMessage = "";
             _statusIsError = false;
@@ -1089,11 +1378,15 @@ namespace ImageSimilarityPlugin
                 useCache: true,
                 onComplete: result =>
                 {
+                    RefreshReferenceCounts(result);
                     _queryResults = result;
                     _featureCacheStaleness = null; // 查询后缓存已更新，清除警告
-                    float topScore = result.results.Count > 0 ? result.results[0].similarity : 0f;
-                    _statusMessage = $"搜索完成：在 {result.total_images} 张图片中找到 {result.results.Count} 张相似图片" +
-                                     (result.results.Count > 0 ? $" (最高相似度: {topScore:P1})" : "");
+                    int resultCount = result.results?.Count ?? 0;
+                    int failedCount = result.failed_images?.Count ?? 0;
+                    float topScore = resultCount > 0 ? result.results[0].similarity : 0f;
+                    _statusMessage = $"搜索完成：在 {result.total_images} 张图片中找到 {resultCount} 张相似图片" +
+                                     (resultCount > 0 ? $" (最高相似度: {topScore:P1})" : "") +
+                                     (failedCount > 0 ? $"，跳过 {failedCount} 张处理失败的图片" : string.Empty);
                     _statusIsError = false;
                     Repaint();
                 },
@@ -1102,8 +1395,20 @@ namespace ImageSimilarityPlugin
                     _statusMessage = error;
                     _statusIsError = true;
                     Repaint();
-                }
+                },
+                excludedDirectories: ExcludedDirectorySettings.GetDirectories()
             );
+        }
+
+        private void DrawStatusMessage()
+        {
+            if (string.IsNullOrEmpty(_statusMessage))
+                return;
+
+            Color previousColor = GUI.color;
+            GUI.color = _statusIsError ? Color.red : previousColor;
+            EditorGUILayout.LabelField(_statusMessage, EditorStyles.wordWrappedLabel);
+            GUI.color = previousColor;
         }
 
         /// <summary>
@@ -1117,7 +1422,7 @@ namespace ImageSimilarityPlugin
 
             EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
             GUI.color = new Color(1f, 0.85f, 0.3f);
-            var sb = new System.Text.StringBuilder();
+            var sb = new StringBuilder();
             sb.Append("⚠️ 特征缓存可能过期：");
             if (_featureCacheStaleness.fresh_count > 0)
                 sb.Append($"{_featureCacheStaleness.fresh_count} 张未变  ");
@@ -1130,8 +1435,8 @@ namespace ImageSimilarityPlugin
             EditorGUILayout.LabelField(sb.ToString(), EditorStyles.miniLabel);
             GUI.color = Color.white;
 
-            bool canScan = !string.IsNullOrEmpty(_pythonVersion) && _depsInstalled && !_runner.IsRunning;
-            GUI.enabled = canScan;
+            bool previousEnabled = GUI.enabled;
+            GUI.enabled = previousEnabled && CanStartRunner;
             if (GUILayout.Button("重新扫描", GUILayout.Width(100), GUILayout.Height(22)))
             {
                 if (_tabIndex == 0)
@@ -1139,7 +1444,7 @@ namespace ImageSimilarityPlugin
                 else
                     StartQuery();
             }
-            GUI.enabled = true;
+            GUI.enabled = previousEnabled;
             EditorGUILayout.EndHorizontal();
         }
 
@@ -1156,7 +1461,7 @@ namespace ImageSimilarityPlugin
 
             EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
             GUI.color = new Color(1f, 0.85f, 0.3f); // yellow tint
-            var sb = new System.Text.StringBuilder();
+            var sb = new StringBuilder();
             sb.Append("📦 缓存已增量更新：");
             if (info.fresh_used > 0)
                 sb.Append($"{info.fresh_used} 张复用缓存  ");
@@ -1192,7 +1497,7 @@ namespace ImageSimilarityPlugin
 
             EditorGUILayout.Space(5);
 
-            _scrollPos = EditorGUILayout.BeginScrollView(_scrollPos);
+            _queryScrollPos = EditorGUILayout.BeginScrollView(_queryScrollPos);
 
             for (int i = 0; i < _queryResults.results.Count; i++)
             {
@@ -1212,34 +1517,13 @@ namespace ImageSimilarityPlugin
             EditorGUILayout.BeginHorizontal(EditorStyles.helpBox);
 
             // 排名标签
-            var rankStyle = new GUIStyle(EditorStyles.boldLabel)
-            {
-                alignment = TextAnchor.MiddleCenter,
-                fontSize = 14,
-            };
-            EditorGUILayout.LabelField($"#{img.rank}", rankStyle, GUILayout.Width(40));
+            EditorGUILayout.LabelField($"#{img.rank}", GetQueryRankStyle(), GUILayout.Width(40));
 
             // 缩略图
             Texture2D thumb = GetThumbnail(img.image_path);
-            Rect thumbRect = GUILayoutUtility.GetRect(THUMB_SIZE, THUMB_SIZE,
-                GUILayout.Width(THUMB_SIZE), GUILayout.Height(THUMB_SIZE));
-            EditorGUI.DrawRect(thumbRect, new Color(0.2f, 0.2f, 0.2f, 0.5f));
-            if (thumb != null)
-            {
-                float texAspect = (float)thumb.width / Mathf.Max(1, thumb.height);
-                float drawW, drawH;
-                if (texAspect >= 1f) { drawW = THUMB_SIZE; drawH = THUMB_SIZE / texAspect; }
-                else { drawH = THUMB_SIZE; drawW = THUMB_SIZE * texAspect; }
-                Rect drawRect = new Rect(
-                    thumbRect.x + (THUMB_SIZE - drawW) / 2f,
-                    thumbRect.y + (THUMB_SIZE - drawH) / 2f,
-                    drawW, drawH);
-                GUI.DrawTexture(drawRect, thumb, ScaleMode.StretchToFill);
-            }
-            else
-            {
-                GUI.Label(thumbRect, "?", EditorStyles.centeredGreyMiniLabel);
-            }
+            Rect thumbRect = GUILayoutUtility.GetRect(ThumbnailSize, ThumbnailSize,
+                GUILayout.Width(ThumbnailSize), GUILayout.Height(ThumbnailSize));
+            DrawThumbnail(thumbRect, thumb);
 
             // 点击缩略图定位
             if (GUI.Button(thumbRect, GUIContent.none, GUIStyle.none))
@@ -1253,11 +1537,8 @@ namespace ImageSimilarityPlugin
             // 中间：文件信息
             EditorGUILayout.BeginVertical();
             EditorGUILayout.LabelField(Path.GetFileName(img.image_path), EditorStyles.boldLabel);
-            string assetPath = PluginUtils.AbsoluteToAssetPath(img.image_path);
-            if (!string.IsNullOrEmpty(assetPath))
-                EditorGUILayout.LabelField(assetPath, EditorStyles.miniLabel);
-            else
-                EditorGUILayout.LabelField(img.image_path, EditorStyles.miniLabel);
+            string displayPath = PluginUtils.ToDisplayPath(img.image_path);
+            EditorGUILayout.LabelField(new GUIContent(displayPath, displayPath), EditorStyles.miniLabel);
             try
             {
                 var fi = new FileInfo(img.image_path);
@@ -1289,14 +1570,158 @@ namespace ImageSimilarityPlugin
             EditorGUILayout.EndHorizontal();
         }
 
+        /// <summary>目录输入框显示 Assets/...，内部始终保存绝对路径。</summary>
+        private static string DrawEditablePathField(string absolutePath)
+        {
+            string displayPath = PluginUtils.ToDisplayPath(absolutePath);
+            string editedPath = EditorGUILayout.TextField(displayPath);
+            return editedPath == displayPath
+                ? absolutePath
+                : PluginUtils.ToAbsolutePath(editedPath);
+        }
+
+        private void SetFolderPath(string path)
+        {
+            if (string.Equals(_folderPath, path, StringComparison.Ordinal))
+                return;
+
+            _folderPath = path;
+            SearchDirectorySettings.Save(path);
+        }
+
+        /// <summary>扫描结果展示前使角标失效，并在 FR2 存在待处理资产时自动刷新索引。</summary>
+        private void RefreshReferenceCounts(ScanResultData result)
+        {
+            var imagePaths = new List<string>();
+            if (result?.groups != null)
+            {
+                foreach (DuplicateGroup group in result.groups)
+                    if (group?.images != null)
+                        imagePaths.AddRange(group.images);
+            }
+
+            RefreshReferenceCounts(imagePaths);
+        }
+
+        /// <summary>查询结果使用与分组扫描相同的 FR2 刷新边界。</summary>
+        private void RefreshReferenceCounts(QueryResultData result)
+        {
+            var imagePaths = new List<string>();
+            if (result?.results != null)
+            {
+                foreach (SimilarImage image in result.results)
+                    if (!string.IsNullOrEmpty(image?.image_path))
+                        imagePaths.Add(image.image_path);
+            }
+
+            RefreshReferenceCounts(imagePaths);
+        }
+
+        private void RefreshReferenceCounts(IEnumerable<string> imagePaths)
+        {
+            FR2Integration.RefreshReferenceCountsIfPending(imagePaths, OnReferenceCountsRefreshed);
+        }
+
+        private void OnReferenceCountsRefreshed(bool _)
+        {
+            if (this != null)
+                Repaint();
+        }
+
+        /// <summary>绘制分组扫描和以图搜图共用的项目级排除目录列表。</summary>
+        private void DrawExcludedDirectories()
+        {
+            string[] directories = ExcludedDirectorySettings.GetDirectories();
+            string removePath = null;
+
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            EditorGUILayout.BeginHorizontal();
+            _showExcludedDirectories = EditorGUILayout.Foldout(
+                _showExcludedDirectories,
+                $"排除目录 ({directories.Length})",
+                true);
+            GUILayout.FlexibleSpace();
+
+            bool previousEnabled = GUI.enabled;
+            GUI.enabled = previousEnabled && !_runner.IsRunning;
+            if (GUILayout.Button(new GUIContent("+", "添加排除目录"), EditorStyles.miniButton, GUILayout.Width(24)))
+            {
+                string initialFolder = Directory.Exists(_folderPath) ? _folderPath : Application.dataPath;
+                string selected = EditorUtility.OpenFolderPanel("选择需要排除的目录", initialFolder, string.Empty);
+                if (!string.IsNullOrEmpty(selected))
+                {
+                    bool added = ExcludedDirectorySettings.TryAdd(selected, out string message);
+                    _statusMessage = message;
+                    _statusIsError = !added;
+                    if (added)
+                        OnExcludedDirectoriesChanged();
+                }
+            }
+            EditorGUILayout.EndHorizontal();
+
+            if (_showExcludedDirectories)
+            {
+                foreach (string directory in directories)
+                {
+                    EditorGUILayout.BeginHorizontal();
+                    string displayPath = PluginUtils.ToDisplayPath(directory);
+                    EditorGUILayout.LabelField(new GUIContent(displayPath, displayPath), EditorStyles.miniLabel);
+                    if (GUILayout.Button(new GUIContent("-", "移除排除目录"), EditorStyles.miniButton, GUILayout.Width(24)))
+                        removePath = directory;
+                    EditorGUILayout.EndHorizontal();
+                }
+            }
+
+            GUI.enabled = previousEnabled;
+            EditorGUILayout.EndVertical();
+
+            if (!string.IsNullOrEmpty(removePath) && ExcludedDirectorySettings.Remove(removePath))
+            {
+                _statusMessage = $"已移除排除目录: {PluginUtils.ToDisplayPath(removePath)}";
+                _statusIsError = false;
+                OnExcludedDirectoriesChanged();
+            }
+        }
+
+        /// <summary>排除范围变化后清除当前展示状态，并让两类缓存按新范围重新检查。</summary>
+        private void OnExcludedDirectoriesChanged()
+        {
+            _lastCheckedFolder = null;
+            _lastCheckedExclusionScope = null;
+            _lastFeatureCheckFolder = null;
+            _lastFeatureCheckExclusionScope = null;
+            _hasCache = false;
+            _cacheInfo = string.Empty;
+            _featureCacheStaleness = null;
+            ClearAllResults();
+            ClearThumbnailCache();
+            Repaint();
+        }
+
         /// <summary>
-        /// 基于文件夹路径的稳定哈希生成缓存文件名。
-        /// 不同文件夹对应不同的缓存，互不干扰。
+        /// 基于文件夹路径、递归范围和排除目录生成稳定缓存键。
+        /// 任一搜索范围变化后都不会复用其他范围的扫描结果。
         /// </summary>
         private string GetCacheFilePath()
         {
-            string hash = _folderPath.GetHashCode().ToString("X8");
+            // string.GetHashCode 不保证跨进程稳定，使用 Hash128 让重启后的缓存键保持一致。
+            string normalizedPath = Path.GetFullPath(_folderPath)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            if (Application.platform == RuntimePlatform.WindowsEditor)
+                normalizedPath = normalizedPath.ToUpperInvariant();
+            string scopeKey = normalizedPath
+                + "|recursive=" + _recursive
+                + "|excluded=" + ExcludedDirectorySettings.GetScopeKey();
+            string hash = Hash128.Compute(scopeKey).ToString();
             return Path.Combine(CacheDir, $"scan_{hash}.json");
+        }
+
+        private string GetResultCacheFilePath()
+        {
+            if (string.IsNullOrEmpty(_cachePath)) return null;
+            string directory = Path.GetDirectoryName(_cachePath);
+            string fileName = Path.GetFileNameWithoutExtension(_cachePath) + "_result.json";
+            return Path.Combine(directory ?? string.Empty, fileName);
         }
 
         /// <summary>缓存的元数据结构（不包含完整分组信息）</summary>
@@ -1305,6 +1730,8 @@ namespace ImageSimilarityPlugin
         {
             public string folder;
             public float threshold;
+            public bool recursive;
+            public string exclusion_scope;
             public int total_images;
             public int total_groups;
             public string date;
@@ -1321,24 +1748,39 @@ namespace ImageSimilarityPlugin
 
         private void ToggleSelection(int groupId, int imageIndex)
         {
-            if (!_selectedForDeletion.ContainsKey(groupId))
-                _selectedForDeletion[groupId] = new HashSet<int>();
-
-            if (_selectedForDeletion[groupId].Contains(imageIndex))
-                _selectedForDeletion[groupId].Remove(imageIndex);
-            else
-                _selectedForDeletion[groupId].Add(imageIndex);
+            HashSet<int> selection = GetOrCreateSelection(groupId);
+            if (!selection.Add(imageIndex))
+            {
+                selection.Remove(imageIndex);
+                if (selection.Count == 0)
+                    _selectedForDeletion.Remove(groupId);
+            }
         }
 
         private void SetSelection(int groupId, int imageIndex, bool selected)
         {
-            if (!_selectedForDeletion.ContainsKey(groupId))
-                _selectedForDeletion[groupId] = new HashSet<int>();
-
             if (selected)
-                _selectedForDeletion[groupId].Add(imageIndex);
-            else
-                _selectedForDeletion[groupId].Remove(imageIndex);
+            {
+                GetOrCreateSelection(groupId).Add(imageIndex);
+                return;
+            }
+
+            if (!_selectedForDeletion.TryGetValue(groupId, out HashSet<int> selection))
+                return;
+
+            selection.Remove(imageIndex);
+            if (selection.Count == 0)
+                _selectedForDeletion.Remove(groupId);
+        }
+
+        private HashSet<int> GetOrCreateSelection(int groupId)
+        {
+            if (_selectedForDeletion.TryGetValue(groupId, out HashSet<int> selection))
+                return selection;
+
+            selection = new HashSet<int>();
+            _selectedForDeletion[groupId] = selection;
+            return selection;
         }
 
         private int GetSelectedCount(int groupId)
@@ -1357,10 +1799,9 @@ namespace ImageSimilarityPlugin
         /// </summary>
         private bool IsInProjectAssets(DuplicateGroup group)
         {
-            string assetsRoot = Application.dataPath.Replace('/', Path.DirectorySeparatorChar);
             foreach (var img in group.images)
             {
-                if (!Path.GetFullPath(img).StartsWith(assetsRoot, StringComparison.OrdinalIgnoreCase))
+                if (string.IsNullOrEmpty(PluginUtils.AbsoluteToAssetPath(img)))
                     return false;
             }
             return true;
@@ -1391,6 +1832,45 @@ namespace ImageSimilarityPlugin
 
             _thumbnailCache[path] = tex;
             return tex;
+        }
+
+        private GUIStyle GetQueryRankStyle()
+        {
+            if (_queryRankStyle != null)
+                return _queryRankStyle;
+
+            _queryRankStyle = new GUIStyle(EditorStyles.boldLabel)
+            {
+                alignment = TextAnchor.MiddleCenter,
+                fontSize = 14,
+            };
+            return _queryRankStyle;
+        }
+
+        /// <summary>在固定区域内按原始宽高比绘制缩略图。</summary>
+        private static void DrawThumbnail(Rect rect, Texture2D texture)
+        {
+            EditorGUI.DrawRect(rect, new Color(0.2f, 0.2f, 0.2f, 0.5f));
+            if (texture == null)
+            {
+                GUI.Label(rect, "?", EditorStyles.centeredGreyMiniLabel);
+                return;
+            }
+
+            float textureAspect = (float)texture.width / Mathf.Max(1, texture.height);
+            float drawWidth = rect.width;
+            float drawHeight = rect.height;
+            if (textureAspect >= 1f)
+                drawHeight /= textureAspect;
+            else
+                drawWidth *= textureAspect;
+
+            Rect drawRect = new Rect(
+                rect.x + (rect.width - drawWidth) / 2f,
+                rect.y + (rect.height - drawHeight) / 2f,
+                drawWidth,
+                drawHeight);
+            GUI.DrawTexture(drawRect, texture, ScaleMode.StretchToFill);
         }
 
         /// <summary>清除缩略图缓存，释放所有内存中的纹理对象</summary>

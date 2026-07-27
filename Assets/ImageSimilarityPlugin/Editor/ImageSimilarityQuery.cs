@@ -58,6 +58,7 @@ namespace ImageSimilarityPlugin
 
         /// <summary>
         /// 异步查询与指定图片视觉上相似的图片。
+        /// 搜索候选会自动排除 ExcludedDirectorySettings 中配置的目录。
         /// </summary>
         /// <param name="queryImagePath">查询图片的绝对路径</param>
         /// <param name="folderPath">搜索目标文件夹的绝对路径（通常为 Application.dataPath）</param>
@@ -83,13 +84,25 @@ namespace ImageSimilarityPlugin
             // 验证
             if (string.IsNullOrEmpty(queryImagePath) || !File.Exists(queryImagePath))
             {
-                onError?.Invoke($"查询图片不存在: {queryImagePath}");
+                onError?.Invoke($"查询图片不存在: {PluginUtils.ToDisplayPath(queryImagePath)}");
                 return null;
             }
 
             if (string.IsNullOrEmpty(folderPath) || !Directory.Exists(folderPath))
             {
-                onError?.Invoke($"目标文件夹不存在: {folderPath}");
+                onError?.Invoke($"目标文件夹不存在: {PluginUtils.ToDisplayPath(folderPath)}");
+                return null;
+            }
+
+            if (threshold < 0f || threshold > 1f)
+            {
+                onError?.Invoke("相似度阈值必须在 0 到 1 之间。");
+                return null;
+            }
+
+            if (topK < 1 || workers < 1)
+            {
+                onError?.Invoke("最大结果数和线程数必须大于或等于 1。");
                 return null;
             }
 
@@ -111,6 +124,7 @@ namespace ImageSimilarityPlugin
         /// <summary>
         /// 弹出相似图片选择器窗口。
         /// 自动搜索项目中与 queryImagePath 相似的图片，
+        /// 并应用当前项目的排除目录设置。
         /// 用户可选择一张已有图片来替代导入，也可关闭窗口表示不选用。
         /// </summary>
         /// <param name="queryImagePath">查询图片（即将导入的新图片）的绝对路径</param>
@@ -136,7 +150,7 @@ namespace ImageSimilarityPlugin
         }
 
         // ==================================================================
-        //  外部入口 — 菜单项
+        //  Project 图片右键入口
         // ==================================================================
 
         /// <summary>
@@ -152,11 +166,17 @@ namespace ImageSimilarityPlugin
             string fullPath = Path.GetFullPath(Path.Combine(Application.dataPath, "..", assetPath));
             if (!File.Exists(fullPath)) return;
 
-            ShowPicker(fullPath, Application.dataPath,
+            // 右键查询必须先确认范围，默认使用图片所在目录，避免无意间扫描整个 Assets。
+            string defaultFolder = Path.GetDirectoryName(fullPath);
+            string searchFolder = EditorUtility.OpenFolderPanel(
+                "选择相似图片搜索目录", defaultFolder ?? Application.dataPath, string.Empty);
+            if (string.IsNullOrEmpty(searchFolder)) return;
+
+            ShowPicker(fullPath, searchFolder,
                 onPicked: selectedPath =>
                 {
                     if (selectedPath != null)
-                        Debug.Log($"[ImageSimilarityQuery] 用户选择了: {selectedPath}");
+                        Debug.Log($"[ImageSimilarityQuery] 用户选择了: {PluginUtils.ToDisplayPath(selectedPath)}");
                     else
                         Debug.Log("[ImageSimilarityQuery] 用户未选择，继续使用原图。");
                 });
@@ -179,24 +199,5 @@ namespace ImageSimilarityPlugin
                 || ext == ".psd" || ext == ".tga";
         }
 
-        /// <summary>
-        /// 顶部菜单入口：以图搜图选择器（手动选择查询图片）。
-        /// </summary>
-        [MenuItem("Tools/以图搜图(选择器)")]
-        private static void ShowPickerFromMenu()
-        {
-            string selected = EditorUtility.OpenFilePanel("选择查询图片",
-                Application.dataPath, "png,jpg,jpeg,bmp,gif,tiff,tif,webp");
-            if (string.IsNullOrEmpty(selected)) return;
-
-            ShowPicker(selected, Application.dataPath,
-                onPicked: selectedPath =>
-                {
-                    if (selectedPath != null)
-                        Debug.Log($"[ImageSimilarityQuery] 用户选择了: {selectedPath}");
-                    else
-                        Debug.Log("[ImageSimilarityQuery] 用户未选择。");
-                });
-        }
     }
 }
