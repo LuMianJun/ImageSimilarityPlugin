@@ -313,7 +313,7 @@ namespace ImageSimilarityPlugin
             string displayPath = PluginUtils.ToDisplayPath(img.image_path);
             EditorGUILayout.LabelField(
                 new GUIContent(displayPath, displayPath),
-                EditorStyles.miniLabel);
+                EditorStyles.wordWrappedMiniLabel);
             try
             {
                 var fi = new FileInfo(img.image_path);
