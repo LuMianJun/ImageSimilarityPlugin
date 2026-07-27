@@ -54,8 +54,6 @@ namespace ImageSimilarityPlugin
         private GUIStyle _queryRankStyle;
         private Vector2 _pendingScrollPos;
         private bool _hasPendingScrollPos;
-        private float _resultsViewportHeight;
-        private float _pendingResultsViewportHeight;
         private readonly Dictionary<int, Vector2> _thumbScrolls = new Dictionary<int, Vector2>();
         private readonly Dictionary<int, Vector2> _pendingThumbScrolls = new Dictionary<int, Vector2>();
         private readonly Dictionary<int, float> _groupHeights = new Dictionary<int, float>();
@@ -546,16 +544,9 @@ namespace ImageSimilarityPlugin
             Vector2 currentScroll = _scanScrollPos;
             Vector2 updatedScroll = EditorGUILayout.BeginScrollView(currentScroll);
 
-            if (Event.current.type == EventType.Repaint)
-            {
-                Rect viewportRect = GUILayoutUtility.GetLastRect();
-                if (viewportRect.height > 1f)
-                    _pendingResultsViewportHeight = viewportRect.height;
-            }
-
-            float viewportHeight = _resultsViewportHeight > 1f
-                ? _resultsViewportHeight
-                : Mathf.Max(1f, position.height);
+            // position.height 略大于实际可视区（含标题栏），用于虚拟化可见性判断
+            // 足够精确，且避免了 BeginScrollView 后调用 GetLastRect() 导致报错。
+            float viewportHeight = Mathf.Max(1f, position.height);
             float visibleTop = Mathf.Max(0f, currentScroll.y);
             float visibleBottom = visibleTop + viewportHeight;
             float groupTop = 0f;
@@ -801,12 +792,6 @@ namespace ImageSimilarityPlugin
                 _hasPendingScrollPos = false;
             }
 
-            if (_pendingResultsViewportHeight > 1f)
-            {
-                _resultsViewportHeight = _pendingResultsViewportHeight;
-                _pendingResultsViewportHeight = 0f;
-            }
-
             foreach (var pair in _pendingGroupHeights)
                 _groupHeights[pair.Key] = pair.Value;
             _pendingGroupHeights.Clear();
@@ -847,8 +832,6 @@ namespace ImageSimilarityPlugin
             _scanScrollPos = Vector2.zero;
             _pendingScrollPos = Vector2.zero;
             _hasPendingScrollPos = false;
-            _resultsViewportHeight = 0f;
-            _pendingResultsViewportHeight = 0f;
             _thumbScrolls.Clear();
             _pendingThumbScrolls.Clear();
             _groupHeights.Clear();
