@@ -680,6 +680,13 @@ namespace ImageSimilarityPlugin
                 _thumbScrolls[group.id] = Vector2.zero;
             var scroll = _thumbScrolls[group.id];
             scroll.y = 0f;
+
+            // 保存滚轮事件，防止内层横向滚动视图吞掉垂直滚轮 delta
+            Event outerEvent = Event.current;
+            Vector2 savedScrollDelta = (outerEvent.type == EventType.ScrollWheel)
+                ? outerEvent.delta
+                : Vector2.zero;
+
             Vector2 updatedScroll = GUILayout.BeginScrollView(
                 scroll,
                 true,
@@ -743,6 +750,13 @@ namespace ImageSimilarityPlugin
 
             EditorGUILayout.EndHorizontal();
             GUILayout.EndScrollView();
+
+            // 恢复被内层横向滚动视图吞掉的纵向滚轮事件，让外层可继续响应
+            if (savedScrollDelta.y != 0f && outerEvent.type == EventType.Used)
+            {
+                outerEvent.delta = new Vector2(0f, savedScrollDelta.y);
+                outerEvent.type = EventType.ScrollWheel;
+            }
 
             if (updatedScroll != scroll)
                 _pendingThumbScrolls[group.id] = updatedScroll;
